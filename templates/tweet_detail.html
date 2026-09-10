@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}推文详情 - Twitter(X) AI 监控系统{% endblock %}
+{% block title %}推文详情 - Twitter(X) 监控系统{% endblock %}
 
 {% block content %}
 <div class="row">
@@ -32,39 +32,17 @@
                             </small>
                         </div>
                     </div>
-                    <a href="{{ tweet.tweet_url }}" target="_blank" class="btn btn-outline-primary btn-sm">
-                        <i class="bi bi-box-arrow-up-right"></i> 查看原文
-                    </a>
+                    <div class="d-flex gap-2">
+                        <button type="button" class="btn btn-outline-success btn-sm push-tweet-btn" data-tweet-id="{{ tweet.id }}">
+                            <i class="bi bi-send"></i> 发送到当前群
+                        </button>
+                        <a href="{{ tweet.tweet_url }}" target="_blank" class="btn btn-outline-primary btn-sm">
+                            <i class="bi bi-box-arrow-up-right"></i> 查看原文
+                        </a>
+                    </div>
                 </div>
             </div>
             <div class="card-body">
-                <!-- AI生成的标题 -->
-                <div class="mb-4">
-                    <h4 class="text-primary">
-                        <i class="bi bi-lightbulb-fill"></i> {{ tweet.ai_title }}
-                    </h4>
-                </div>
-
-                <!-- AI翻译 -->
-                <div class="mb-4">
-                    <h5 class="border-bottom pb-2">
-                        <i class="bi bi-translate"></i> AI翻译
-                    </h5>
-                    <div class="content-box p-3 rounded">
-                        <p class="mb-0">{{ tweet.ai_translation }}</p>
-                    </div>
-                </div>
-
-                <!-- AI解读 -->
-                <div class="mb-4">
-                    <h5 class="border-bottom pb-2">
-                        <i class="bi bi-chat-text"></i> AI解读
-                    </h5>
-                    <div class="content-box p-3 rounded">
-                        <p class="mb-0" style="white-space: pre-line;">{{ tweet.ai_analysis }}</p>
-                    </div>
-                </div>
-
                 <!-- 原文 -->
                 <div class="mb-4">
                     <h5 class="border-bottom pb-2">
@@ -74,7 +52,14 @@
                         <p class="mb-0" style="white-space: pre-line;">{{ tweet.original_text }}</p>
                     </div>
                 </div>
-
+                {% if tweet.translation %}
+                <div class="mb-4">
+                    <h5 class="border-bottom pb-2"><i class="bi bi-translate"></i> 中文翻译</h5>
+                    <div class="content-box p-3 rounded">
+                        <p class="mb-0" style="white-space: pre-line;">{{ tweet.translation }}</p>
+                    </div>
+                </div>
+                {% endif %}
                 <!-- 处理信息 -->
                 <div class="row">
                     <div class="col-md-6">

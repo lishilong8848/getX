@@ -1,0 +1,141 @@
+# ======================
+# Python
+# ======================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.spec
+pip-log.txt
+
+# ======================
+# 数据库 / 持久化
+# ======================
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.db-journal
+
+# ======================
+# 压缩包
+# ======================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.gz
+*.7z
+*.bz2
+
+# ======================
+# 构建产物 / Java
+# ======================
+build/
+dist/
+node_modules/
+*.class
+*.jar
+*.war
+*.ear
+target/
+out/
+.gradle/
+build-tools/
+
+# ======================
+# 日志
+# ======================
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ======================
+# 本地配置 / 敏感信息
+# ======================
+.env
+.env.*
+*.local
+config.local.json
+config.local.yaml
+config.local.yml
+
+# ======================
+# IDE / 编辑器
+# ======================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.project
+.classpath
+.settings/
+
+# ======================
+# 项目运行时数据（不应入版本控制）
+# ======================
+data/
+data_test/
+.workbuddy/
+.cache/
+*.pid
+
+# ======================
+# 测试 / 调试产物
+# ======================
+test_*.py
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ======================
+# 临时 / 上传中文件
+# ======================
+*.tmp
+*.bak
+*.swp
+*.orig
+~*
+
+# ======================
+# 大体积二进制
+# ======================
+*.bin
+*.pkl
+*.pklz
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.onnx
+*.pt
+*.pth
+*.model
+
+# ======================
+# 前端构建产物（如果有）
+# ======================
+static/dist/
+static/build/
+static/node_modules/
+.next/
+.nuxt/
+.parcel-cache/

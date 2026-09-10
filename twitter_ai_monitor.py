@@ -2,360 +2,369 @@ import requests
 import time
 import json
 import os
-from datetime import datetime, timedelta
-from openai import OpenAI
+import base64
+import html
+import re
+from datetime import datetime, timedelta, timezone
+
+from feishu_bitable import FeishuBitable, build_record_payload as build_bitable_payload
+
+
+NITTER_SOURCES = (
+    "https://xcancel.com",
+    "https://nitter.net",
+    "https://nitter.tiekoetter.com",
+    "https://nitter.space",
+)
+
+BAD_TRANSLATION_MARKERS = ("AI处理失败", "翻译异常", "处理异常", "Invalid URL", "内容安全检查失败")
+_ARGOS_READY = False
+
+
+def parse_nitter_time(value: str) -> datetime | None:
+    match = re.search(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{4}) · (\d{1,2}):(\d{2}) (AM|PM) UTC", value)
+    if not match:
+        return None
+    month_names = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+    month, day, year, hour, minute, meridiem = match.groups()
+    hour = int(hour) % 12 + (12 if meridiem == "PM" else 0)
+    return datetime(int(year), month_names.index(month) + 1, int(day), hour, int(minute))
+
+
+def clean_html(value: str) -> str:
+    value = re.sub(r"<br\s*/?>", "\n", value)
+    return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def parse_nitter_tweets(page_html: str, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False) -> list:
+    tweets = []
+    blocks = re.findall(r'<div class="timeline-item[^"]*"[^>]*data-username="([^"]+)"[^>]*>(.*?)(?=<div class="timeline-item|\Z)', page_html, re.S)
+    for author, block in blocks:
+        if author.lower() != account.lower():
+            continue
+        link = re.search(r'<a class="tweet-link" href="([^"]*/status/(\d+)[^"]*)"', block)
+        content = re.search(r'<div class="tweet-content[^"]*"[^>]*>(.*?)</div>\s*<div class="tweet-stats"', block, re.S)
+        date = re.search(r'<span class="tweet-date"><a [^>]*title="([^"]+)"', block)
+        if not link or not content or not date:
+            continue
+        text = clean_html(content.group(1))
+        created_at = parse_nitter_time(html.unescape(date.group(1)))
+        if not text or not created_at or (exclude_replies and text.startswith("@")):
+            continue
+        if since_time <= created_at <= until_time:
+            tweets.append({"id": link.group(2), "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": author or account})
+    return tweets
+
+
+def _extract_tweet_text_from_individual_page(page_html: str) -> str | None:
+    """从单条推文页 (x.com/{user}/status/{id}) 提取完整正文。
+
+    单条推文页的 SSR HTML 里：
+    - og:description 通常截断到 300 字符（不够）
+    - 渲染后的 <h1 class="sr-only"> 包含全文（屏幕阅读器用的隐藏标题）
+    这里优先用 <h1 class="sr-only">（最完整），找不到再回退到 og:description。
+    """
+    # 1) <h1 class="sr-only"> 节点（屏幕阅读器标题，含全文）
+    m = re.search(r'<h1[^>]*class="sr-only"[^>]*>(.*?)</h1>', page_html, re.S)
+    if m:
+        raw = html.unescape(m.group(1)).strip()
+        # 形如 `Tibo on X: "..."` — 去掉作者前缀和包裹引号
+        m2 = re.search(r'^.*?X:\s*["\u201c](.+)["\u201d]\s*$', raw, re.S)
+        if m2:
+            text = m2.group(1).strip()
+        else:
+            # 兜底：去掉 `XX on X: ` 前缀
+            idx = raw.find('X: ')
+            text = raw[idx+3:].strip().strip('"').strip() if idx >= 0 else raw
+        if text:
+            return text
+    # 2) data-testid="tweetText"
+    m = re.search(r'<div[^>]*data-testid="tweetText"[^>]*>(.*?)</div>\s*<div[^>]*data-testid=', page_html, re.S)
+    if m:
+        text = clean_html(m.group(1)).strip()
+        if text:
+            return text
+    # 3) og:description（保底，截断到 300 字符）
+    m = re.search(r'<meta property="og:description" content="([^"]*)"', page_html)
+    if m:
+        return html.unescape(m.group(1)).strip()
+    return None
+
+
+def fetch_full_texts(tweet_ids: list, headers: dict | None = None, timeout: int = 15) -> dict:
+    """对一组推文 id 单独请求 /status/{id} 页面以获取完整正文。
+    返回 {tweet_id: full_text} 字典，请求失败的 id 不在结果里。
+    """
+    if not tweet_ids:
+        return {}
+    headers = headers or {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
+    out: dict = {}
+    for tid in tweet_ids:
+        try:
+            r = requests.get(f"https://x.com/i/status/{tid}", headers=headers, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            full = _extract_tweet_text_from_individual_page(r.text)
+            if full:
+                out[tid] = full
+        except Exception as error:
+            print(f"⚠️ 获取完整推文 {tid} 失败: {error}")
+    return out
+
+
+def parse_x_profile_tweets(page_html: str, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False) -> tuple[list, list]:
+    """解析 X.com 个人主页。
+
+    返回 (tweets, long_tweet_ids)：
+    - tweets: 解析得到的推文列表（长推文使用截断版 full_text，待后续 fetch_full_texts 补全）
+    - long_tweet_ids: 带有 note_tweet 引用、需要单独请求 /status/{id} 页面以拿到完整正文的长推文 id
+    """
+    tweets = []
+    long_tweet_ids = []
+    seen = set()
+    tweet_ids = re.findall(rf'data-href="/{re.escape(account)}/status/(\d+)"', page_html)
+    for tweet_id in tweet_ids:
+        if tweet_id in seen:
+            continue
+
+        encoded_id = base64.b64encode(f"Tweet:{tweet_id}".encode()).decode()
+        match = re.search(rf'"client:{re.escape(encoded_id)}:details".*?full_text:"((?:\\.|[^"\\])*)".*?created_at_ms:(\d+)', page_html, re.S)
+        if not match:
+            continue
+        raw_text, created_ms = match.groups()
+        seen.add(tweet_id)
+        try:
+            text = html.unescape(json.loads(f'"{raw_text}"')).strip()
+            created_at = datetime.fromtimestamp(int(created_ms) / 1000, timezone.utc).replace(tzinfo=None)
+        except Exception:
+            continue
+        if not text or (exclude_replies and text.startswith("@")):
+            continue
+        if not (since_time <= created_at <= until_time):
+            continue
+        # 检测该 Tweet 记录是否带 note_tweet 引用（长推文标记）
+        if re.search(rf'note_tweet:\$R\[\d+\]=\{{__ref:"client:{re.escape(encoded_id)}:note_tweet"\}}', page_html):
+            long_tweet_ids.append(tweet_id)
+        tweets.append({"id": tweet_id, "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": account})
+    tweets.sort(key=lambda item: item["createdAt"], reverse=True)
+    return tweets, long_tweet_ids
+
+
+def format_tweet_post_time(created_at: str) -> str:
+    if not created_at:
+        return "未知时间"
+    try:
+        if "T" in created_at:
+            utc_time = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        else:
+            from email.utils import parsedate_to_datetime
+            utc_time = parsedate_to_datetime(created_at)
+        if utc_time.tzinfo is None:
+            utc_time = utc_time.replace(tzinfo=timezone.utc)
+        return utc_time.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as error:
+        print(f"❌ 通知时间解析错误: {error}")
+        return "未知时间"
+
+
+def should_translate_to_chinese(text: str) -> bool:
+    text = re.sub(r"https?://\S+", "", text or "").strip()
+    # ponytail: ASCII/CJK heuristic; add a real language detector only if mixed-language tweets matter.
+    return bool(re.search(r"[A-Za-z]{3,}", text)) and not re.search(r"[\u4e00-\u9fff]", text)
+
+
+def get_argos_translation(text: str) -> str:
+    global _ARGOS_READY
+    import argostranslate.package
+    import argostranslate.translate
+
+    if not _ARGOS_READY:
+        try:
+            argostranslate.translate.translate("Hello", "en", "zh")
+        except Exception:
+            argostranslate.package.update_package_index()
+            package = next(
+                (item for item in argostranslate.package.get_available_packages() if item.from_code == "en" and item.to_code == "zh"),
+                None,
+            )
+            if package is None:
+                raise RuntimeError("未找到 Argos en->zh 模型")
+            argostranslate.package.install_from_path(package.download())
+        _ARGOS_READY = True
+
+    return argostranslate.translate.translate(text, "en", "zh").strip()
 
 
 class TwitterAIMonitor:
-    """Twitter推文监控和AI处理器"""
+    """Twitter 推文监控和本地翻译转发器"""
     
-    def __init__(self, twitter_api_key: str, llm_url: str, llm_api_key: str, data_dir: str = "data", 
+    def __init__(self, twitter_api_key: str, llm_url: str = "", llm_api_key: str = "", data_dir: str = "data",
                  dingtalk_webhook: str = "", dingtalk_secret: str = "", enable_dingtalk: bool = False,
-                 ai_max_retries: int = 3, ai_timeout: int = 30, ai_max_tokens: int = 1000):
+                 ai_max_retries: int = 3, ai_timeout: int = 30, ai_max_tokens: int = 1000,
+                 deepl_api_key: str = "", push_channel: str = "none", feishu_webhook: str = "",
+                 feishu_secret: str = "",
+                 feishu_app_id: str = "", feishu_app_secret: str = "",
+                 feishu_app_token: str = "", feishu_table_id: str = ""):
         """
         初始化监控器
-        
-        :param twitter_api_key: TwitterAPI.io API Key
+
+        :param twitter_api_key: 兼容旧配置，公开抓取不再使用
         :param llm_url: 大模型接口URL
-        :param llm_api_key: 大模型API Key
-        :param data_dir: 数据存储目录
+        :param llm_api_key: 兼容旧配置，已不再使用
+        :param data_dir: 数据存储目录（仅兼容旧调用，存储已迁到飞书多维表格）
         :param dingtalk_webhook: 钉钉机器人Webhook地址
         :param dingtalk_secret: 钉钉机器人签名密钥
         :param enable_dingtalk: 是否启用钉钉推送
         :param ai_max_retries: AI调用最大重试次数
         :param ai_timeout: AI调用超时时间（秒）
         :param ai_max_tokens: AI调用最大token数量
+        :param feishu_app_id / feishu_app_secret / feishu_app_token / feishu_table_id: 飞书多维表格凭据
         """
         self.twitter_api_key = twitter_api_key
-        self.llm_client = OpenAI(
-            api_key=llm_api_key,
-            base_url=llm_url,
-        )
         self.data_dir = data_dir
         self.dingtalk_webhook = dingtalk_webhook
         self.dingtalk_secret = dingtalk_secret
         self.enable_dingtalk = enable_dingtalk
+        self.push_channel = push_channel
+        self.feishu_webhook = feishu_webhook
+        self.feishu_secret = feishu_secret
         self.ai_max_retries = ai_max_retries
         self.ai_timeout = ai_timeout
         self.ai_max_tokens = ai_max_tokens
-        # 确保数据目录存在
-        os.makedirs(data_dir, exist_ok=True)
-    
-    def get_ai_response(self, prompt: str, max_retries: int = None) -> str:
-        """
-        调用AI模型获取响应，支持重试机制
-        
-        :param prompt: 输入提示词
-        :param max_retries: 最大重试次数，默认使用配置值
-        :return: AI响应内容
-        """
-        if max_retries is None:
-            max_retries = self.ai_max_retries
-            
-        for attempt in range(max_retries):
-            try:
-                print(f"🤖 AI调用尝试 {attempt + 1}/{max_retries}")
-                
-                completion = self.llm_client.chat.completions.create(
-                    model="qwen-plus",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    timeout=self.ai_timeout,  # 使用配置的超时时间
-                    max_tokens=self.ai_max_tokens  # 使用配置的token数量
-                )
-                
-                response = completion.choices[0].message.content
-                if response and response.strip():
-                    print(f"✅ AI调用成功 (尝试 {attempt + 1})")
-                    return response
-                else:
-                    print(f"⚠️ AI返回空响应 (尝试 {attempt + 1})")
-                    if attempt < max_retries - 1:
-                        time.sleep(2)  # 等待2秒后重试
-                        continue
-                    else:
-                        return "AI返回空响应，请重试"
-                        
-            except Exception as e:
-                error_msg = str(e)
-                print(f"❌ AI调用出错 (尝试 {attempt + 1}): {error_msg}")
-                
-                # 根据错误类型决定是否重试
-                if "rate limit" in error_msg.lower() or "429" in error_msg:
-                    print("🚫 遇到频率限制，等待后重试...")
-                    time.sleep(10)  # 频率限制等待10秒
-                elif "timeout" in error_msg.lower() or "timed out" in error_msg:
-                    print("⏰ 请求超时，等待后重试...")
-                    time.sleep(5)  # 超时等待5秒
-                elif "invalid api key" in error_msg.lower() or "401" in error_msg:
-                    print("🔑 API密钥无效，停止重试")
-                    return f"API密钥错误: {error_msg}"
-                elif "quota exceeded" in error_msg.lower():
-                    print("💳 API配额已用完，停止重试")
-                    return f"API配额已用完: {error_msg}"
-                elif "data_inspection_failed" in error_msg.lower() or "inappropriate content" in error_msg.lower():
-                    print("🚫 内容安全检查失败，尝试内容清理后重试...")
-                    # 对于内容安全检查失败，等待更长时间后重试
-                    time.sleep(8)  # 内容安全检查失败等待8秒
-                    if attempt < max_retries - 1:
-                        continue
-                    else:
-                        return f"内容安全检查失败: 推文内容可能包含不当内容，已尝试清理但仍有问题"
-                else:
-                    print("❓ 未知错误，等待后重试...")
-                    time.sleep(3)  # 其他错误等待3秒
-                
-                # 如果不是最后一次尝试，继续重试
-                if attempt < max_retries - 1:
-                    continue
-                else:
-                    return f"AI处理失败: {error_msg}"
-        
-        return "AI处理失败: 已达到最大重试次数"
-    
-    def process_tweet_with_ai(self, tweet_text: str) -> dict:
-        """
-        使用AI处理推文：翻译、解读、生成标题
-        
-        :param tweet_text: 推文内容
-        :return: 包含AI处理结果的字典
-        """
-        # 验证推文内容
-        if not tweet_text or not tweet_text.strip():
-            print("⚠️ 推文内容为空，跳过AI处理")
-            return {
-                'title': '推文内容为空',
-                'translation': '推文内容为空',
-                'analysis': '推文内容为空，无法进行分析'
-            }
-        
-        # 内容预处理，过滤可能导致内容安全检查失败的内容
-        print("🧹 正在进行内容预处理...")
-        cleaned_text = self.preprocess_tweet_content(tweet_text)
-        
-        # 限制推文长度，避免过长内容导致AI处理失败
-        if len(cleaned_text) > 1000:
-            print(f"⚠️ 推文内容过长 ({len(cleaned_text)} 字符)，截取前1000字符")
-            cleaned_text = cleaned_text[:1000] + "..."
-        
-        print(f"📝 开始AI处理推文，原始长度: {len(tweet_text)}, 处理后长度: {len(cleaned_text)}")
-        
-        try:
-            # 翻译推文
-            print("🔄 正在翻译推文...")
-            translate_prompt = f"""请将以下英文推文翻译成中文，保持原意和语气：
-
-推文内容：{cleaned_text}
-
-请只返回翻译结果，不要包含其他说明。"""
-            
-            translation = self.get_ai_response(translate_prompt)
-            print(f"✅ 翻译完成: {translation[:50]}...")
-            
-            # 解读推文
-            print("🔄 正在解读推文...")
-            analysis_prompt = f"""请对以下推文进行深度解读分析，包括其含义、背景、可能的影响等,全文内容在160字左右：
-
-推文内容：{cleaned_text}
-
-请从以下角度进行分析：
-1. 推文的主要信息和观点
-2. 可能的背景和原因
-3. 对相关领域的影响
-4. 其他值得关注的要点
-
-请用中文回答，内容要有深度和见解。"""
-            
-            analysis = self.get_ai_response(analysis_prompt)
-            print(f"✅ 解读完成: {analysis[:50]}...")
-            
-            # 生成标题
-            print("🔄 正在生成标题...")
-            title_prompt = f"""请为以下推文生成一个简洁有力的中文标题，要求：
-1. 控制在15-25个字以内
-2. 能够准确概括推文的核心内容
-3. 具有吸引力和新闻性
-
-推文内容：{cleaned_text}
-
-请只返回标题，不要包含其他内容。"""
-            
-            title = self.get_ai_response(title_prompt)
-            print(f"✅ 标题生成完成: {title}")
-            
-            # 验证AI处理结果
-            if "AI处理失败" in translation or "AI处理失败" in analysis or "AI处理失败" in title:
-                print("❌ AI处理结果包含错误信息")
-                return {
-                    'title': f"处理异常: {title}",
-                    'translation': f"翻译异常: {translation}",
-                    'analysis': f"解读异常: {analysis}"
-                }
-            
-            return {
-                'title': title.strip(),
-                'translation': translation.strip(),
-                'analysis': analysis.strip()
-            }
-            
-        except Exception as e:
-            print(f"❌ AI处理过程出现异常: {str(e)}")
-            return {
-                'title': f"处理异常: {str(e)[:50]}",
-                'translation': f"翻译异常: {str(e)[:50]}",
-                'analysis': f"解读异常: {str(e)[:50]}"
-            }
-    
-    def preprocess_tweet_content(self, tweet_text: str) -> str:
-        """
-        预处理推文内容，过滤可能导致内容安全检查失败的内容
-        
-        :param tweet_text: 原始推文内容
-        :return: 预处理后的内容
-        """
-        if not tweet_text:
-            return ""
-        
-        # 转换为小写进行检查
-        text_lower = tweet_text.lower()
-        
-        # 定义可能导致内容安全检查失败的词汇模式
-        problematic_patterns = [
-            # 政治敏感词汇（英文）
-            r'\b(trump|biden|politics|government|election|vote|democrat|republican)\b',
-            # 暴力相关词汇
-            r'\b(kill|death|murder|violence|attack|war|bomb|gun|weapon)\b',
-            # 色情相关词汇
-            r'\b(sex|porn|nude|naked|sexual|adult)\b',
-            # 毒品相关词汇
-            r'\b(drug|heroin|cocaine|marijuana|weed|addiction)\b',
-            # 其他敏感词汇
-            r'\b(hate|racist|discrimination|abuse|suicide)\b'
-        ]
-        
-        import re
-        
-        # 检查是否包含问题词汇
-        has_problematic_content = False
-        for pattern in problematic_patterns:
-            if re.search(pattern, text_lower):
-                has_problematic_content = True
-                print(f"⚠️ 检测到可能的问题内容: {pattern}")
-                break
-        
-        if has_problematic_content:
-            # 如果检测到问题内容，进行内容清理
-            print("🧹 正在进行内容清理...")
-            
-            # 替换敏感词汇为中性词汇
-            replacements = {
-                r'\btrump\b': 'former president',
-                r'\bbiden\b': 'current president',
-                r'\bpolitics\b': 'public affairs',
-                r'\bgovernment\b': 'administration',
-                r'\belection\b': 'voting process',
-                r'\bvote\b': 'participate',
-                r'\bkill\b': 'eliminate',
-                r'\bdeath\b': 'passing',
-                r'\bmurder\b': 'incident',
-                r'\bviolence\b': 'conflict',
-                r'\battack\b': 'incident',
-                r'\bwar\b': 'conflict',
-                r'\bbomb\b': 'device',
-                r'\bgun\b': 'weapon',
-                r'\bweapon\b': 'tool',
-                r'\bsex\b': 'relationship',
-                r'\bporn\b': 'adult content',
-                r'\bnude\b': 'unclothed',
-                r'\bnaked\b': 'unclothed',
-                r'\bsexual\b': 'intimate',
-                r'\badult\b': 'mature',
-                r'\bdrug\b': 'substance',
-                r'\bheroin\b': 'illegal substance',
-                r'\bcocaine\b': 'illegal substance',
-                r'\bmarijuana\b': 'cannabis',
-                r'\bweed\b': 'cannabis',
-                r'\baddiction\b': 'dependency',
-                r'\bhate\b': 'dislike',
-                r'\bracist\b': 'discriminatory',
-                r'\bdiscrimination\b': 'bias',
-                r'\babuse\b': 'mistreatment',
-                r'\bsuicide\b': 'self-harm'
-            }
-            
-            cleaned_text = tweet_text
-            for pattern, replacement in replacements.items():
-                cleaned_text = re.sub(pattern, replacement, cleaned_text, flags=re.IGNORECASE)
-            
-            print(f"✅ 内容清理完成，原始长度: {len(tweet_text)}, 清理后长度: {len(cleaned_text)}")
-            return cleaned_text
-        
-        return tweet_text
-    
-    def get_tweets_from_account(self, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False) -> list:
-        """
-        获取指定账号在指定时间范围内的推文
-        
-        :param account: Twitter账号
-        :param since_time: 开始时间
-        :param until_time: 结束时间
-        :param exclude_replies: 是否排除回复推文
-        :return: 推文列表
-        """
-        since_str = since_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-        until_str = until_time.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        # 根据配置决定是否排除回复
-        if exclude_replies:
-            query = f"from:{account} -is:reply since:{since_str} until:{until_str} include:nativeretweets"
+        # 飞书多维表格客户端（用于查重 + 持久化）
+        if feishu_app_id and feishu_app_secret and feishu_app_token and feishu_table_id:
+            self.bitable: FeishuBitable | None = FeishuBitable(
+                app_id=feishu_app_id,
+                app_secret=feishu_app_secret,
+                app_token=feishu_app_token,
+                table_id=feishu_table_id,
+            )
         else:
-            query = f"from:{account} since:{since_str} until:{until_str} include:nativeretweets"
-            
-        url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
-        params = {"query": query, "queryType": "Latest"}
-        headers = {"X-API-Key": self.twitter_api_key}
-        
-        all_tweets = []
-        next_cursor = None
-        
-        while True:
-            if next_cursor:
-                params["cursor"] = next_cursor
-            
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            
-            if response.status_code == 200:
-                data = response.json()
-                tweets = data.get("tweets", [])
-                
-                if tweets:
-                    for t in tweets:
-                        t['author'] = account  # 添加作者信息
-                    all_tweets.extend(tweets)
-                
-                if data.get("has_next_page", False) and data.get("next_cursor", "") != "":
-                    next_cursor = data.get("next_cursor")
+            self.bitable = None
+        # 兼容旧调用：data_dir 不再用于写入，仅在 bitable 不可用时作为兜底读取历史 JSON
+        os.makedirs(data_dir, exist_ok=True)
+
+    def translate(self, text: str) -> str:
+        if not should_translate_to_chinese(text):
+            return ""
+        try:
+            translated = get_argos_translation(text)
+            return "" if translated == text.strip() else translated
+        except Exception as error:
+            print(f"❌ 本地翻译失败，使用原文: {error}")
+            return ""
+
+    def ensure_translation(self, tweet_data: dict) -> dict:
+        if any(marker in tweet_data.get('translation', '') for marker in BAD_TRANSLATION_MARKERS):
+            tweet_data.pop('translation', None)
+        if not tweet_data.get('translation'):
+            translation = self.translate(tweet_data.get('original_text') or tweet_data.get('text', ''))
+            if translation:
+                tweet_data['translation'] = translation
+        return tweet_data
+
+    def backfill_translations(self) -> int:
+        translated_count = 0
+        if not os.path.exists(self.data_dir):
+            return 0
+        for filename in os.listdir(self.data_dir):
+            if not filename.startswith("tweets_") or not filename.endswith(".json"):
+                continue
+            file_path = os.path.join(self.data_dir, filename)
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    tweets = json.load(f)
+            except json.JSONDecodeError:
+                continue
+
+            changed = False
+            for tweet in tweets:
+                if tweet.get('original_text', '').startswith('@'):
                     continue
-                else:
-                    break
-            else:
-                print(f"获取推文出错: {response.status_code} - {response.text}")
-                break
-        
-        return all_tweets
+                old_translation = tweet.get('translation')
+                self.ensure_translation(tweet)
+                if tweet.get('translation') != old_translation:
+                    changed = True
+                    if tweet.get('translation'):
+                        translated_count += 1
+
+            if changed:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(tweets, f, ensure_ascii=False, indent=2)
+        return translated_count
+
+    def get_tweets_from_account(self, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False) -> list:
+        """从公开页面免费抓取最新推文。"""
+        errors = []
+        try:
+            response = requests.get(
+                f"https://x.com/{account}?lang=en",
+                timeout=20,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+            )
+            response.raise_for_status()
+            tweets, long_ids = parse_x_profile_tweets(response.text, account, since_time, until_time, exclude_replies)
+            if tweets or "full_text" in response.text:
+                # 对带 note_tweet 引用的长推文，单独请求 /status/{id} 拿完整正文
+                if long_ids:
+                    full_texts = fetch_full_texts(long_ids)
+                    for t in tweets:
+                        if t["id"] in full_texts:
+                            t["text"] = full_texts[t["id"]]
+                return tweets
+            errors.append("https://x.com: 页面无推文")
+        except Exception as error:
+            errors.append(f"https://x.com: {error}")
+
+        for source in NITTER_SOURCES:
+            try:
+                response = requests.get(f"{source}/{account}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                response.raise_for_status()
+                tweets = parse_nitter_tweets(response.text, account, since_time, until_time, exclude_replies)
+                if tweets or "timeline-item" in response.text:
+                    return tweets
+                errors.append(f"{source}: 页面无推文")
+            except Exception as error:
+                errors.append(f"{source}: {error}")
+        raise RuntimeError("公开抓取失败：" + "；".join(errors))
     
     def save_tweet_data(self, tweet_data: dict):
         """
-        保存推文数据到JSON文件，按天存储
-        
-        :param tweet_data: 推文数据
+        持久化推文：查重 + 写入飞书多维表格。
+
+        - 查重：在多维表中按 tweet_id 判断；不在本地 JSON 判重。
+        - 写入：把字段映射到多维表格（推文ID/文本/原文/译文/作者/推文链接/发帖时间/采集时间）。
+        - 如果未配置飞书凭据，回退到旧本地 JSON 行为（兼容单元测试等场景）。
         """
+        tweet_id = tweet_data.get('id')
+        author = tweet_data.get('author', 'Unknown')
+
+        # 1) 多维表格查重
+        if self.bitable and tweet_id:
+            try:
+                if self.bitable.record_exists(str(tweet_id)):
+                    print(f"⏭️ 跳过重复推文(多维表格已存在): {tweet_id} - {author}")
+                    return
+            except Exception as err:
+                print(f"⚠️ 多维表格查重失败，降级为本地写入: {err}")
+
+        # 2) 本地翻译（如未翻译）
+        self.ensure_translation(tweet_data)
+
+        # 3) 写入多维表格
+        if self.bitable:
+            try:
+                payload = build_bitable_payload(tweet_data)
+                rec = self.bitable.add_record(payload)
+                print(f"✅ 写入飞书多维表格: {tweet_id} - {author} (record_id={rec.get('record_id')})")
+                self.send_push_notification(tweet_data)
+                return
+            except Exception as err:
+                print(f"❌ 飞书多维表格写入失败: {err}")
+
+        # 4) 兜底：写本地 JSON（仅在未配置多维表格时使用）
         today = datetime.now().strftime("%Y-%m-%d")
         file_path = os.path.join(self.data_dir, f"tweets_{today}.json")
-        
-        # 读取现有数据
         existing_data = []
         if os.path.exists(file_path):
             try:
@@ -363,30 +372,24 @@ class TwitterAIMonitor:
                     existing_data = json.load(f)
             except json.JSONDecodeError:
                 existing_data = []
-        
-        # 检查是否重复 - 根据推文ID去重
-        tweet_id = tweet_data.get('id')
         existing_ids = {item.get('id') for item in existing_data if item.get('id')}
-        
         if tweet_id not in existing_ids:
-            # 添加新数据（仅当ID不重复时）
             existing_data.append(tweet_data)
-            print(f"保存新推文: {tweet_id} - {tweet_data.get('author', 'Unknown')}")
-            
-            # 写入文件
+            print(f"保存新推文(本地): {tweet_id} - {author}")
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(existing_data, f, ensure_ascii=False, indent=2)
-            
-            # 发送钉钉推送
-            if self.enable_dingtalk and self.dingtalk_webhook and self.dingtalk_secret:
-                try:
-                    self.send_dingtalk_notification(tweet_data)
-                except Exception as e:
-                    print(f"钉钉推送失败: {str(e)}")
+            self.send_push_notification(tweet_data)
         else:
-            print(f"跳过重复推文: {tweet_id} - {tweet_data.get('author', 'Unknown')}")
+            print(f"跳过重复推文(本地): {tweet_id} - {author}")
+
+    def send_push_notification(self, tweet_data: dict) -> bool:
+        if self.push_channel == "dingtalk" and self.dingtalk_webhook and self.dingtalk_secret:
+            return self.send_dingtalk_notification(tweet_data)
+        if self.push_channel == "feishu" and self.feishu_webhook and self.feishu_secret:
+            return self.send_feishu_notification(tweet_data)
+        return False
     
-    def send_dingtalk_notification(self, tweet_data: dict):
+    def send_dingtalk_notification(self, tweet_data: dict) -> bool:
         """
         发送钉钉机器人通知
         
@@ -402,57 +405,28 @@ class TwitterAIMonitor:
             # 构建消息内容
             author = tweet_data.get('author', 'Unknown')
             original_created_at_str = tweet_data.get('created_at', '') # 获取原始推文创建时间字符串
-            ai_title = tweet_data.get('ai_title', '')
-            ai_content = tweet_data.get('ai_translation', '')
             original_text = tweet_data.get('original_text', '')
+            translation = tweet_data.get('translation', '')
+            tweet_url = tweet_data.get('tweet_url', '')
+            formatted_tweet_posting_time = format_tweet_post_time(original_created_at_str)
+            translation_block = f"\n## 🇨🇳 **中文翻译：**\n{translation}\n" if translation else ""
             
-            # 检查AI处理是否成功，如果失败则使用原文
-            ai_processing_failed = False
-            if (ai_title and ("处理失败" in ai_title or "内容安全检查失败" in ai_title or "AI标题生成失败" in ai_title)):
-                ai_processing_failed = True
-            if (ai_content and ("处理失败" in ai_content or "内容安全检查失败" in ai_content)):
-                ai_processing_failed = True
-            
-            # 如果AI处理失败，使用原文内容
-            if ai_processing_failed:
-                ai_title = "AI处理失败，显示原文"
-                ai_content = f"**推文原文：**\n{original_text}"
-                print(f"⚠️ AI处理失败，钉钉推送将显示原文内容")
-            
-            # 确保有内容显示
-            if not ai_content:
-                ai_content = f"**推文原文：**\n{original_text[:200]}{'...' if len(original_text) > 200 else ''}"
-            
-            if not ai_title:
-                ai_title = 'AI标题生成失败，显示原文'
-            
-            # 格式化推文发帖时间为北京时间
-            formatted_tweet_posting_time = "未知时间"
-            try:
-                if original_created_at_str:
-                    from email.utils import parsedate_to_datetime
-                    utc_time = parsedate_to_datetime(original_created_at_str)
-                    beijing_time = utc_time + timedelta(hours=8)
-                    formatted_tweet_posting_time = beijing_time.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception as e:
-                print(f"❌ 钉钉通知时间解析错误: {str(e)}")
-                formatted_tweet_posting_time = "未知时间"
-            
-            message = f"""# 🤖 AI新闻推送
+            message = f"""# 📨 X 动态推送
 
 ---
 
 ## 📝 **作者：** {author}
 ⏰ **发帖时间：** {formatted_tweet_posting_time}
 
-🎯 **AI生成标题：** **{ai_title}**
+## 📝 **推文原文：**
+{original_text}
+{translation_block}
 
-## 🧠 **AI翻译内容：**
-{ai_content}
+{f"🔗 [查看原推文]({tweet_url})" if tweet_url else ""}
 
 ---
 
-💡 *由 Twitter(X) AI 监控系统 自动推送*"""
+💡 *由 Twitter(X) 监控系统自动推送*"""
             
             # 计算签名
             timestamp = str(int(time.time() * 1000))
@@ -471,7 +445,7 @@ class TwitterAIMonitor:
             data = {
                 "msgtype": "markdown",
                 "markdown": {
-                    "title": f"🤖 AI新闻推送 - {author}",
+                    "title": f"📨 X 动态 - {author}",
                     "text": message
                 },
                 "at": {
@@ -486,55 +460,184 @@ class TwitterAIMonitor:
                 result = response.json()
                 if result.get('errcode') == 0:
                     print(f"✅ 钉钉消息发送成功: {author}")
+                    return True
                 else:
                     print(f"❌ 钉钉消息发送失败: {result.get('errmsg')}")
+                    return False
             else:
                 print(f"❌ 钉钉请求失败: HTTP {response.status_code}")
+                return False
                 
         except Exception as e:
             print(f"❌ 钉钉消息发送异常: {str(e)}")
+            return False
+
+    def send_feishu_notification(self, tweet_data: dict) -> bool:
+        """使用签名校验发送飞书机器人消息。"""
+        try:
+            import base64
+            import hashlib
+            import hmac
+
+            timestamp = str(int(time.time()))
+            sign = base64.b64encode(hmac.new(f"{timestamp}\n{self.feishu_secret}".encode(), digestmod=hashlib.sha256).digest()).decode()
+            author = tweet_data.get("author", "Unknown")
+            original = tweet_data.get("original_text", "")
+            translation = tweet_data.get("translation", "")
+            post_time = format_tweet_post_time(tweet_data.get("created_at", ""))
+            tweet_url = tweet_data.get("tweet_url", "")
+            translation_text = f"\n\n中文：{translation}" if translation else ""
+            response = requests.post(self.feishu_webhook, json={
+                "timestamp": timestamp,
+                "sign": sign,
+                "msg_type": "text",
+                "content": {"text": f"📨 X 动态 - @{author}\n\n发帖时间：{post_time}\n\n原文：{original}{translation_text}" + (f"\n\n链接：{tweet_url}" if tweet_url else "")},
+            }, timeout=10)
+            result = response.json()
+            success = response.ok and result.get("code", result.get("StatusCode", 0)) == 0
+            print(f"{'✅' if success else '❌'} 飞书消息发送{' 成功' if success else '失败'}: {author}")
+            return success
+        except Exception as error:
+            print(f"❌ 飞书消息发送异常: {error}")
+            return False
     
     def load_tweets_by_date(self, date_str: str = None) -> list:
         """
-        根据日期加载推文数据
-        
+        根据日期加载推文数据（已迁移到飞书多维表格）。
+
         :param date_str: 日期字符串 (YYYY-MM-DD)，默认为今天
         :return: 推文数据列表
         """
         if date_str is None:
             date_str = datetime.now().strftime("%Y-%m-%d")
-        
-        file_path = os.path.join(self.data_dir, f"tweets_{date_str}.json")
-        
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                return []
-        return []
-    
+        all_tweets = self.get_all_tweets()
+        return [t for t in all_tweets if (t.get("processed_date") or "") == date_str or
+                                       str(t.get("created_at", ""))[:10] == date_str]
+
+    def _bitable_field_value(self, fv) -> str:
+        """从 Bitable 字段值里抽取展示用字符串（处理 cell 列表/单值/字典）。"""
+        if fv is None:
+            return ""
+        if isinstance(fv, str):
+            return fv
+        if isinstance(fv, (int, float)):
+            return str(fv)
+        if isinstance(fv, list):
+            parts = []
+            for c in fv:
+                if isinstance(c, dict):
+                    txt = c.get("text") or c.get("name") or c.get("link")
+                    if txt:
+                        parts.append(str(txt))
+                else:
+                    parts.append(str(c))
+            return "\n".join(parts)
+        if isinstance(fv, dict):
+            return fv.get("text") or fv.get("link") or json.dumps(fv, ensure_ascii=False)
+        return str(fv)
+
+    @staticmethod
+    def _ms_to_iso(ms) -> str:
+        if not ms:
+            return ""
+        try:
+            ms = int(ms)
+            return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        except Exception:
+            return ""
+
+    def _record_to_tweet_dict(self, rec_fields: dict, field_name_map: dict) -> dict:
+        """把多维表格返回的 fields 字典转回前端用的 tweet dict（兼容旧字段名）。"""
+        # 反向映射：把 field_id → field_name
+        id_to_name = {v: k for k, v in field_name_map.items()}
+        normalized = {id_to_name.get(k, k): v for k, v in rec_fields.items()}
+
+        tweet_id = self._bitable_field_value(normalized.get("推文ID"))
+        original_text = self._bitable_field_value(normalized.get("原文"))
+        translation = self._bitable_field_value(normalized.get("译文"))
+        title = self._bitable_field_value(normalized.get("文本"))
+        author = self._bitable_field_value(normalized.get("作者"))
+        link = self._bitable_field_value(normalized.get("推文链接"))
+        created_ms = normalized.get("发帖时间")
+        collected_ms = normalized.get("采集时间")
+        created_at = self._ms_to_iso(created_ms)
+        timestamp = self._ms_to_iso(collected_ms)
+
+        return {
+            "id": tweet_id,
+            "author": author,
+            "original_text": original_text,
+            "text": original_text,
+            "translation": translation,
+            "title": title,
+            "tweet_url": link,
+            "created_at": created_at,
+            "createdAt": created_at,
+            "timestamp": timestamp,
+            "processed_date": datetime.fromtimestamp(int(collected_ms) / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d") if collected_ms else "",
+            "source": "feishu_bitable",
+        }
+
+    def _read_from_bitable(self) -> list:
+        """从飞书多维表格拉取全部记录，转为前端可用的 tweet dict 列表。"""
+        if not self.bitable:
+            return []
+        try:
+            field_map = self.bitable.get_field_id_map()
+            url = f"{self.bitable.base}/bitable/v1/apps/{self.bitable.app_token}/tables/{self.bitable.table_id}/records"
+            items: list = []
+            page_token = None
+            while True:
+                params = {"page_size": 500, "automatic_fields": "false"}
+                if page_token:
+                    params["page_token"] = page_token
+                r = requests.get(url, params=params, headers=self.bitable._headers(), timeout=self.bitable.timeout)
+                data = r.json()
+                if data.get("code") != 0:
+                    print(f"⚠️ 拉取多维表格记录失败: {data.get('msg')}")
+                    return items
+                items.extend(data["data"].get("items", []))
+                if not data["data"].get("has_more") or not data["data"].get("page_token"):
+                    break
+                page_token = data["data"].get("page_token")
+            return [self._record_to_tweet_dict(it.get("fields", {}), field_map) for it in items]
+        except Exception as err:
+            print(f"⚠️ 读取飞书多维表格失败: {err}")
+            return []
+
+    def _read_from_local_legacy(self) -> list:
+        """兜底：从旧本地 JSON 读取历史数据（仅用于无多维表格时的兼容）。"""
+        all_tweets = []
+        if not os.path.exists(self.data_dir):
+            return all_tweets
+        for filename in os.listdir(self.data_dir):
+            if filename.startswith("tweets_") and filename.endswith(".json"):
+                file_path = os.path.join(self.data_dir, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        tweets = json.load(f)
+                        for tweet in tweets:
+                            if any(marker in tweet.get('translation', '') for marker in BAD_TRANSLATION_MARKERS):
+                                tweet.pop('translation', None)
+                            tweet.pop('ai_title', None)
+                            tweet.pop('ai_translation', None)
+                            tweet.pop('ai_analysis', None)
+                        all_tweets.extend(tweets)
+                except json.JSONDecodeError:
+                    continue
+        all_tweets.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        return all_tweets
+
     def get_all_tweets(self) -> list:
         """
-        获取所有存储的推文数据
-        
-        :return: 所有推文数据列表
+        获取所有存储的推文数据。优先从飞书多维表格读取（如果已配置），
+        否则从本地 JSON 文件兜底读取（兼容历史数据）。
         """
-        all_tweets = []
-        
-        # 遍历数据目录中的所有JSON文件
-        if os.path.exists(self.data_dir):
-            for filename in os.listdir(self.data_dir):
-                if filename.startswith("tweets_") and filename.endswith(".json"):
-                    file_path = os.path.join(self.data_dir, filename)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            tweets = json.load(f)
-                            all_tweets.extend(tweets)
-                    except json.JSONDecodeError:
-                        continue
-        
-        # 按时间排序（最新的在前）
+        if self.bitable:
+            all_tweets = self._read_from_bitable()
+        else:
+            all_tweets = self._read_from_local_legacy()
+        # 按时间倒序
         all_tweets.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         return all_tweets
     
@@ -555,10 +658,15 @@ class TwitterAIMonitor:
             since_time = last_checked_time
             
             all_tweets = []
+            all_accounts_ok = True
             
             for account in target_accounts:
-                tweets = self.get_tweets_from_account(account, since_time, until_time, exclude_replies)
-                all_tweets.extend(tweets)
+                try:
+                    tweets = self.get_tweets_from_account(account, since_time, until_time, exclude_replies)
+                    all_tweets.extend(tweets)
+                except Exception as e:
+                    all_accounts_ok = False
+                    print(f"❌ 获取 @{account} 推文失败，保留检查窗口下轮重试: {str(e)}")
                 
                 # 添加5秒延迟，避免API限制
                 if account != target_accounts[-1]:  # 如果不是最后一个账号，添加延迟
@@ -566,7 +674,7 @@ class TwitterAIMonitor:
                     time.sleep(5)
             
             if all_tweets:
-                print(f"发现 {len(all_tweets)} 条新推文，开始AI处理...\n")
+                print(f"发现 {len(all_tweets)} 条新推文，开始转发...\n")
                 
                 for idx, tweet in enumerate(all_tweets, start=1):
                     print(f"{'='*60}")
@@ -584,34 +692,6 @@ class TwitterAIMonitor:
                     print(f"链接：{tweet_url}")
                     print()
                     
-                    # AI处理
-                    try:
-                        print(f"🧠 开始AI处理推文 {idx}/{len(all_tweets)}")
-                        ai_result = self.process_tweet_with_ai(original_text)
-                        
-                        # 检查AI处理结果质量
-                        if any("处理异常" in str(v) or "翻译异常" in str(v) or "解读异常" in str(v) for v in ai_result.values()):
-                            print(f"⚠️ AI处理结果质量不佳，推文ID: {tweet_id}")
-                            # 可以选择跳过保存或标记为低质量
-                        
-                    except Exception as e:
-                        print(f"❌ AI处理推文失败: {str(e)}")
-                        
-                        # 检查是否是内容安全检查失败
-                        if "data_inspection_failed" in str(e).lower() or "inappropriate content" in str(e).lower():
-                            print("🚫 内容安全检查失败，使用备用处理策略...")
-                            # 使用备用策略：简单的关键词提取和基本翻译
-                            ai_result = self.fallback_processing(original_text)
-                        else:
-                            ai_result = {
-                                'title': f"处理失败: {str(e)[:50]}",
-                                'translation': f"原文: {original_text[:100]}{'...' if len(original_text) > 100 else ''}",
-                                'analysis': f"AI处理失败: {str(e)}"
-                            }
-                    
-                    print(f"AI标题：{ai_result['title']}")
-                    print(f"AI翻译：{ai_result['translation']}")
-                    print(f"AI解读：{ai_result['analysis']}")
                     print(f"{'='*60}\n")
                     
                     # 保存数据到JSON
@@ -621,9 +701,6 @@ class TwitterAIMonitor:
                         'created_at': tweet.get('createdAt'),
                         'original_text': original_text,
                         'tweet_url': tweet_url,
-                        'ai_title': ai_result['title'],
-                        'ai_translation': ai_result['translation'],
-                        'ai_analysis': ai_result['analysis'],
                         'timestamp': datetime.utcnow().isoformat(),
                         'processed_date': datetime.now().strftime("%Y-%m-%d")
                     }
@@ -631,14 +708,17 @@ class TwitterAIMonitor:
                     
                     # 添加延迟避免API频率限制
                     time.sleep(2)
+            elif not all_accounts_ok:
+                print(f"{datetime.utcnow()} - 抓取失败，保留上次检查时间，下轮继续补抓。")
             else:
                 print(f"{datetime.utcnow()} - 没有发现新推文。")
             
-            last_checked_time = until_time
+            if all_accounts_ok:
+                last_checked_time = until_time
         
         print(f"开始监控账号: {', '.join(target_accounts)}")
         print(f"检查间隔: {check_interval} 秒")
-        print(f"AI处理功能已启用\n")
+        print("本地翻译转发已启用\n")
         
         try:
             while True:
@@ -677,6 +757,7 @@ class TwitterAIMonitor:
             since_time = last_checked_time
             
             all_tweets = []
+            all_accounts_ok = True
             
             try:
                 # 更新状态：开始抓取
@@ -695,6 +776,7 @@ class TwitterAIMonitor:
                             time.sleep(5)
                             
                     except Exception as e:
+                        all_accounts_ok = False
                         print(f"❌ 获取 @{account} 推文失败: {str(e)}")
                         update_status(f"⚠️ @{account} 数据获取异常", result=f"错误: {str(e)}")
                         continue
@@ -704,7 +786,7 @@ class TwitterAIMonitor:
                 return
             
             if all_tweets:
-                update_status(f"🤖 发现 {len(all_tweets)} 条新推文，AI分析中...", result=f"找到 {len(all_tweets)} 条新推文")
+                update_status(f"📨 发现 {len(all_tweets)} 条新推文，转发中...", result=f"找到 {len(all_tweets)} 条新推文")
                 
                 for idx, tweet in enumerate(all_tweets, start=1):
                     # 基本信息
@@ -712,26 +794,7 @@ class TwitterAIMonitor:
                     tweet_url = f"https://twitter.com/{tweet['author']}/status/{tweet_id}"
                     original_text = tweet.get('text', '')
                     
-                    # 更新状态：AI处理中
-                    update_status(f"🧠 AI处理中... ({idx}/{len(all_tweets)})", f"@{tweet['author']}")
-                    
-                    # AI处理
-                    try:
-                        print(f"🧠 开始AI处理推文 {idx}/{len(all_tweets)}")
-                        ai_result = self.process_tweet_with_ai(original_text)
-                        
-                        # 检查AI处理结果质量
-                        if any("处理异常" in str(v) or "翻译异常" in str(v) or "解读异常" in str(v) for v in ai_result.values()):
-                            print(f"⚠️ AI处理结果质量不佳，推文ID: {tweet_id}")
-                            # 可以选择跳过保存或标记为低质量
-                        
-                    except Exception as e:
-                        print(f"❌ AI处理推文失败: {str(e)}")
-                        ai_result = {
-                            'title': f"处理失败: {str(e)[:50]}",
-                            'translation': f"原文: {original_text[:100]}{'...' if len(original_text) > 100 else ''}",
-                            'analysis': f"AI处理失败: {str(e)}"
-                        }
+                    update_status(f"📨 转发中... ({idx}/{len(all_tweets)})", f"@{tweet['author']}")
                     
                     # 保存数据到JSON
                     tweet_data = {
@@ -740,9 +803,6 @@ class TwitterAIMonitor:
                         'created_at': tweet.get('createdAt'),
                         'original_text': original_text,
                         'tweet_url': tweet_url,
-                        'ai_title': ai_result['title'],
-                        'ai_translation': ai_result['translation'],
-                        'ai_analysis': ai_result['analysis'],
                         'timestamp': datetime.utcnow().isoformat(),
                         'processed_date': datetime.now().strftime("%Y-%m-%d")
                     }
@@ -756,10 +816,13 @@ class TwitterAIMonitor:
                     time.sleep(2)
                 
                 update_status("✅ 处理完成", result=f"成功处理 {len(all_tweets)} 条推文")
+            elif not all_accounts_ok:
+                update_status("⚠️ 抓取失败，下轮继续补抓", result="本轮抓取失败，未推进检查时间")
             else:
                 update_status("⭐ 智能待机中", result="未发现新推文，继续监控中...")
             
-            last_checked_time = until_time
+            if all_accounts_ok:
+                last_checked_time = until_time
         
         update_status("🚀 Neural Network 已启动", f"监控 {len(target_accounts)} 个账号")
         print(f"🚀 监控启动成功，目标账号: {target_accounts}")
@@ -785,72 +848,6 @@ class TwitterAIMonitor:
             update_status("❌ 监控异常停止", result=f"错误: {str(e)}")
             if status_dict:
                 status_dict["running"] = False
-
-    def fallback_processing(self, tweet_text: str) -> dict:
-        """
-        备用处理策略：当AI处理失败时，提供基本的信息提取
-        
-        :param tweet_text: 推文内容
-        :return: 基本的处理结果
-        """
-        print("🔄 启用备用处理策略...")
-        
-        try:
-            # 简单的关键词提取
-            import re
-            
-            # 提取URL
-            urls = re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', tweet_text)
-            
-            # 提取@用户名
-            usernames = re.findall(r'@(\w+)', tweet_text)
-            
-            # 提取#话题标签
-            hashtags = re.findall(r'#(\w+)', tweet_text)
-            
-            # 提取数字
-            numbers = re.findall(r'\d+', tweet_text)
-            
-            # 简单的长度统计
-            word_count = len(tweet_text.split())
-            char_count = len(tweet_text)
-            
-            # 生成基本信息
-            title = f"推文分析 (备用处理)"
-            
-            # 生成基本翻译（保持原文，添加说明）
-            translation = f"原文内容: {tweet_text[:200]}{'...' if len(tweet_text) > 200 else ''}"
-            
-            # 生成基本分析
-            analysis_parts = []
-            if urls:
-                analysis_parts.append(f"包含链接: {len(urls)} 个")
-            if usernames:
-                analysis_parts.append(f"提及用户: {', '.join(usernames)}")
-            if hashtags:
-                analysis_parts.append(f"话题标签: {', '.join(hashtags)}")
-            if numbers:
-                analysis_parts.append(f"数字信息: {', '.join(numbers)}")
-            
-            analysis_parts.append(f"文本长度: {word_count} 词, {char_count} 字符")
-            
-            analysis = f"备用分析结果: {'; '.join(analysis_parts)}。由于内容安全检查失败，无法进行AI深度分析。"
-            
-            print("✅ 备用处理完成")
-            return {
-                'title': title,
-                'translation': translation,
-                'analysis': analysis
-            }
-            
-        except Exception as e:
-            print(f"❌ 备用处理也失败: {str(e)}")
-            return {
-                'title': '处理失败',
-                'translation': f'原文: {tweet_text[:100]}{"..." if len(tweet_text) > 100 else ""}',
-                'analysis': f'AI处理和备用处理均失败: {str(e)}'
-            }
-
 
 # 主程序
 if __name__ == "__main__":
@@ -910,4 +907,4 @@ if __name__ == "__main__":
                                 dingtalk_webhook=DINGTALK_WEBHOOK, 
                                 dingtalk_secret=DINGTALK_SECRET, 
                                 enable_dingtalk=ENABLE_DINGTALK)
-    monitor.monitor_and_process(TARGET_ACCOUNTS, CHECK_INTERVAL, INITIAL_HOURS, EXCLUDE_REPLIES) 
+    monitor.monitor_and_process(TARGET_ACCOUNTS, CHECK_INTERVAL, INITIAL_HOURS, EXCLUDE_REPLIES)

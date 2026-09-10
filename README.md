@@ -1,16 +1,16 @@
-# 🤖 Twitter AI 监控系统
+# Twitter(X) 监控系统
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/Flask-2.3+-green.svg)](https://flask.palletsprojects.com/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-一个智能的Twitter(X)推文监控系统，结合AI技术自动翻译和生成中文摘要及AI分析，支持钉钉机器人推送，让您及时获取关注领域的最新动态。。
+一个 Twitter(X) 推文监控系统，自动抓取指定账号的新推文，保存原文和本地中文翻译，并支持钉钉/飞书机器人推送。
 
 ## ✨ 主要功能
 
-- 🔍 **智能监控**: 自动监控指定Twitter账号的新推文
-- 🤖 **AI处理**: 使用大语言模型自动翻译推文内容并生成中文标题，并对推文内容进行分析处理
-- 📱 **钉钉推送**: 支持钉钉机器人实时推送重要信息
+- 🔍 **推文监控**: 自动监控指定Twitter账号的新推文
+- 🌐 **本地翻译**: 使用 Argos Translate 将英文推文翻译为中文
+- 📱 **机器人推送**: 支持钉钉/飞书机器人实时推送
 - 🌐 **Web界面**: 提供友好的Web管理界面，实时查看监控状态
 - 📊 **数据管理**: 自动存储推文数据，支持去重和清理
 - ⚡ **实时更新**: 可配置的检查间隔，确保信息及时性
@@ -20,7 +20,7 @@
 ### 环境要求
 
 - Python 3.8+
-- 网络连接（访问Twitter API和AI模型）
+- 网络连接（访问公开 X 页面）
 
 ### 安装步骤
 
@@ -75,37 +75,36 @@ python3 start.py
 
 ## 📋 配置说明
 
-### Twitter API
-- 使用 [TwitterAPI.io](https://twitterapi.io/) 服务
-- 支持高级搜索和实时监控
+### X 推文抓取
+- 自动从公开页面抓取指定账号推文
+- 无需登录和 TwitterAPI.io Key，公开源失效时可能需要更换镜像
 
-### AI模型
-- 支持多种大语言模型接口
-- 默认配置为阿里云通义千问
-- 可自定义模型参数和重试策略
+### 本地翻译
+- 使用 Argos Translate 本地模型
+- 仅翻译英文推文，翻译失败时保留原文
 
-### 钉钉机器人
-- 支持钉钉群机器人推送
+### 机器人
+- 支持钉钉/飞书群机器人推送
 - 自动签名验证
-- 智能内容过滤
+- 原文和本地翻译转发
 
 ## 🎯 使用场景
 
 - **AI研究者**: 监控OpenAI、Google、Meta等AI公司的官方动态
-- **技术博主**: 获取最新技术资讯，生成中文内容
+- **技术博主**: 获取最新技术资讯
 - **投资分析**: 跟踪重要新闻和产品发布
-- **内容创作**: 自动翻译和摘要，提高内容创作效率
+- **内容创作**: 收集和转发推文原文
 
 ## 🏗️ 系统架构
 
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Twitter API   │───▶│  AI Monitor     │───▶│  LLM Service    │
+│ Public X Page   │───▶│  X Monitor      │───▶│ Local Translate │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │                       │                       │
          ▼                       ▼                       ▼
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Web Interface  │◀───│  Data Storage   │◀───│  AI Processing  │
+│  Web Interface  │◀───│  Data Storage   │◀───│  Bot Push       │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │                       │                       │
          ▼                       ▼                       ▼
@@ -126,7 +125,6 @@ twitter-ai-monitor/
 ├── app.py                 # Flask主应用
 ├── auth.py               # 认证系统模块
 ├── twitter_ai_monitor.py  # 核心监控逻辑
-├── llm.py                # AI模型接口
 ├── tweets.py             # 推文处理模块
 ├── clean_duplicates.py   # 数据清理脚本
 ├── manage_users.py       # 用户管理脚本
@@ -172,10 +170,9 @@ python manage_users.py delete user1
 
 系统会自动：
 1. 监控指定账号的新推文
-2. 使用AI翻译推文内容
-3. 生成中文标题和摘要
-4. 推送到钉钉群
-5. 存储到本地数据库
+2. 本地翻译英文推文
+3. 推送原文和翻译到钉钉/飞书群
+4. 存储到本地 JSON 文件
 
 ## 📝 更新日志
 
@@ -184,7 +181,6 @@ python manage_users.py delete user1
 
 ### v1.0.0
 - 基础监控功能
-- AI翻译和摘要生成
 - 钉钉机器人推送
 - Web管理界面
 

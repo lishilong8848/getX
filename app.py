@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, session
 import json
 import os
+import logging
 from datetime import datetime, timedelta
 import threading
 import time
@@ -14,6 +15,7 @@ from auth import auth_manager, login_required, get_current_user_id
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-change-this-in-production')
+logging.getLogger("werkzeug").addFilter(lambda record: "/api/monitoring_status" not in record.getMessage())
 
 # 全局变量
 monitor_instance = None
@@ -57,6 +59,8 @@ def parse_twitter_time(twitter_time_str):
     try:
         if not twitter_time_str:
             return ""
+        if 'T' in twitter_time_str:
+            return utc_to_beijing(twitter_time_str)
         from email.utils import parsedate_to_datetime
         utc_time = parsedate_to_datetime(twitter_time_str)
         beijing_time = utc_time + timedelta(hours=8)
@@ -71,47 +75,38 @@ def parse_twitter_time(twitter_time_str):
         except:
             return twitter_time_str
 
-def send_dingtalk_message(webhook_url, secret, author, update_time, ai_title, ai_content):
+def is_comment(tweet):
+    """原文以 @ 开头的推文视为评论。"""
+    return tweet.get('original_text', '').startswith('@')
+
+def tweet_created_sort_key(tweet):
+    return parse_twitter_time(tweet.get('created_at', ''))
+
+def send_dingtalk_message(webhook_url, secret, author, update_time, content):
     """
     发送钉钉机器人消息
     :param webhook_url: 钉钉机器人webhook地址
     :param secret: 钉钉机器人签名密钥
     :param author: 作者名称
     :param update_time: 推文的发帖时间 (已转换为北京时间)
-    :param ai_title: AI生成的标题
-    :param ai_content: AI翻译内容
+    :param content: 推文原文
     :return: 是否发送成功
     """
     try:
-        # 检查AI处理是否成功，如果失败则使用原文
-        ai_processing_failed = False
-        if (ai_title and ("处理失败" in ai_title or "内容安全检查失败" in ai_title or "AI标题生成失败" in ai_title)):
-            ai_processing_failed = True
-        if (ai_content and ("处理失败" in ai_content or "内容安全检查失败" in ai_content)):
-            ai_processing_failed = True
-        
-        # 如果AI处理失败，使用原文内容
-        if ai_processing_failed:
-            ai_title = "AI处理失败，显示原文"
-            ai_content = f"**推文原文：**\n{ai_content}"
-            print(f"⚠️ AI处理失败，钉钉推送将显示原文内容")
-        
         # 构建消息内容
-        message = f"""🤖 AI新闻推送
+        message = f"""📨 X 动态推送
 
 ---
 
 📝 **{author}** 更新了推文
 ⏰ **发帖时间：** {update_time}
 
-🎯 **AI生成标题：** **{ai_title}**
-
-🧠 **AI翻译内容：**
-{ai_content}
+📝 **推文原文：**
+{content}
 
 ---
 
-💡 *由 Twitter(X) AI 监控系统 自动推送*"""
+💡 *由 Twitter(X) 监控系统自动推送*"""
         
         # 计算签名
         timestamp = str(round(time.time() * 1000))
@@ -130,7 +125,7 @@ def send_dingtalk_message(webhook_url, secret, author, update_time, ai_title, ai
         data = {
             "msgtype": "markdown",
             "markdown": {
-                "title": f"🤖 AI新闻推送 - {author}",
+                "title": f"📨 X 动态 - {author}",
                 "text": message
             },
             "at": {
@@ -164,23 +159,31 @@ def load_config():
     """加载配置文件"""
     default_config = {
         "TWITTER_API_KEY": "",
-        "LLM_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "LLM_API_KEY": "",
         "TARGET_ACCOUNTS": ["OpenAI"],
         "CHECK_INTERVAL": 300,
-        "INITIAL_HOURS": 2,
+        "INITIAL_HOURS": 24,
         "DINGTALK_WEBHOOK": "",
         "DINGTALK_SECRET": "",
         "ENABLE_DINGTALK": False,
+        "PUSH_CHANNEL": "none",
+        "FEISHU_WEBHOOK": "",
+        "FEISHU_SECRET": "",
+        # 飞书多维表格（用于推文持久化 + 查重）
+        "FEISHU_APP_ID": "",
+        "FEISHU_APP_SECRET": "",
+        "FEISHU_APP_TOKEN": "",
+        "FEISHU_TABLE_ID": "",
         "AI_MAX_RETRIES": 3,
         "AI_TIMEOUT": 30,
         "AI_MAX_TOKENS": 1000
     }
-    
+
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
+                if "PUSH_CHANNEL" not in config:
+                    config["PUSH_CHANNEL"] = "dingtalk" if config.get("ENABLE_DINGTALK") else "none"
                 # 合并默认配置以确保所有键都存在
                 for key, value in default_config.items():
                     if key not in config:
@@ -197,21 +200,26 @@ def save_config(config):
 
 def start_monitoring():
     """启动监控"""
-    global monitor_instance, monitoring_status
+    global monitor_instance, monitoring_status, monitor_thread
     
     config = load_config()
     
-    if not all([config["TWITTER_API_KEY"], config["LLM_API_KEY"]]):
-        return False, "请先配置API密钥"
-    
     try:
+        if monitoring_status.get("running") and monitor_thread and monitor_thread.is_alive():
+            return True, "监控已在运行"
+
         monitor_instance = TwitterAIMonitor(
             config["TWITTER_API_KEY"],
-            config["LLM_URL"],
-            config["LLM_API_KEY"],
             dingtalk_webhook=config.get("DINGTALK_WEBHOOK", ""),
             dingtalk_secret=config.get("DINGTALK_SECRET", ""),
             enable_dingtalk=config.get("ENABLE_DINGTALK", False),
+            push_channel=config.get("PUSH_CHANNEL", "none"),
+            feishu_webhook=config.get("FEISHU_WEBHOOK", ""),
+            feishu_secret=config.get("FEISHU_SECRET", ""),
+            feishu_app_id=config.get("FEISHU_APP_ID", ""),
+            feishu_app_secret=config.get("FEISHU_APP_SECRET", ""),
+            feishu_app_token=config.get("FEISHU_APP_TOKEN", ""),
+            feishu_table_id=config.get("FEISHU_TABLE_ID", ""),
             ai_max_retries=config.get("AI_MAX_RETRIES", 3),
             ai_timeout=config.get("AI_TIMEOUT", 30),
             ai_max_tokens=config.get("AI_MAX_TOKENS", 1000)
@@ -230,18 +238,19 @@ def start_monitoring():
                 exclude_replies
             )
         
-        global monitor_thread
-        monitor_thread = threading.Thread(target=monitor_worker, daemon=True)
-        monitor_thread.start()
-        
         monitoring_status["running"] = True
         monitoring_status["last_update"] = datetime.now().isoformat()
         monitoring_status["current_status"] = "正在初始化..."
         monitoring_status["processed_tweets"] = 0
+
+        monitor_thread = threading.Thread(target=monitor_worker, daemon=True)
+        monitor_thread.start()
         
         return True, "🚀 Neural Network Activated"
         
     except Exception as e:
+        monitoring_status["running"] = False
+        monitoring_status["current_status"] = "启动失败"
         return False, f"❌ Neural Network Error: {str(e)}"
 
 def stop_monitoring():
@@ -320,7 +329,8 @@ def index():
         temp_monitor = TwitterAIMonitor("", "", "")
         all_tweets = temp_monitor.get_all_tweets()
     
-    # 应用筛选
+    # 前端不显示评论
+    all_tweets = [tweet for tweet in all_tweets if not is_comment(tweet)]
     filtered_tweets = all_tweets
     
     if author_filter:
@@ -342,7 +352,7 @@ def index():
             tweet['formatted_created_at'] = parse_twitter_time(tweet['created_at'])
     
     # 按创建时间排序（最新的在前）
-    filtered_tweets.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    filtered_tweets.sort(key=tweet_created_sort_key, reverse=True)
     
     # 获取所有作者列表用于筛选
     authors = list(set([t.get('author', '') for t in all_tweets if t.get('author')]))
@@ -376,7 +386,7 @@ def tweet_detail(tweet_id):
     # 查找指定ID的推文
     tweet = None
     for t in all_tweets:
-        if t.get('id') == tweet_id:
+        if t.get('id') == tweet_id and not is_comment(t):
             tweet = t
             break
     
@@ -413,17 +423,20 @@ def save_config_api():
             return jsonify({"success": False, "message": "未接收到配置数据"})
         
         # 验证必要字段
-        required_fields = ['TWITTER_API_KEY', 'LLM_URL', 'LLM_API_KEY']
+        required_fields = []
         for field in required_fields:
             if not config.get(field):
                 return jsonify({"success": False, "message": f"{field} 不能为空"})
         
-        # 验证钉钉配置
-        if config.get('ENABLE_DINGTALK') == 'true' or config.get('ENABLE_DINGTALK') is True:
+        # 验证已选择的推送渠道
+        if config.get('PUSH_CHANNEL') == 'dingtalk':
             if not config.get('DINGTALK_WEBHOOK'):
                 return jsonify({"success": False, "message": "启用钉钉推送时，钉钉Webhook地址不能为空"})
             if not config.get('DINGTALK_SECRET'):
                 return jsonify({"success": False, "message": "启用钉钉推送时，钉钉签名密钥不能为空"})
+        elif config.get('PUSH_CHANNEL') == 'feishu':
+            if not config.get('FEISHU_WEBHOOK') or not config.get('FEISHU_SECRET'):
+                return jsonify({"success": False, "message": "启用飞书推送时，Webhook 和签名密钥不能为空"})
         
         # 确保TARGET_ACCOUNTS是列表
         if isinstance(config.get('TARGET_ACCOUNTS'), str):
@@ -433,7 +446,7 @@ def save_config_api():
         if 'CHECK_INTERVAL' in config:
             config['CHECK_INTERVAL'] = int(config['CHECK_INTERVAL']) if config['CHECK_INTERVAL'] else 300
         if 'INITIAL_HOURS' in config:
-            config['INITIAL_HOURS'] = int(config['INITIAL_HOURS']) if config['INITIAL_HOURS'] else 2
+            config['INITIAL_HOURS'] = int(config['INITIAL_HOURS']) if config['INITIAL_HOURS'] else 24
         
         # 转换布尔字段
         if 'ENABLE_DINGTALK' in config:
@@ -480,7 +493,8 @@ def tweets_api():
         temp_monitor = TwitterAIMonitor("", "", "")
         all_tweets = temp_monitor.get_all_tweets()
     
-    # 应用筛选
+    # 前端不显示评论
+    all_tweets = [tweet for tweet in all_tweets if not is_comment(tweet)]
     filtered_tweets = all_tweets
     
     if author_filter:
@@ -502,13 +516,39 @@ def tweets_api():
             tweet['formatted_created_at'] = parse_twitter_time(tweet['created_at'])
     
     # 按创建时间排序（最新的在前）
-    filtered_tweets.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    filtered_tweets.sort(key=tweet_created_sort_key, reverse=True)
     
     return jsonify({
         'tweets': filtered_tweets,
         'total': len(filtered_tweets),
         'filtered': len(filtered_tweets) != len(all_tweets)
     })
+
+@app.route('/api/push_tweet/<tweet_id>', methods=['POST'])
+@login_required
+def push_tweet_api(tweet_id):
+    """手动推送指定推文到当前选择的机器人。"""
+    config = load_config()
+    push_channel = config.get("PUSH_CHANNEL", "none")
+    if push_channel not in ("dingtalk", "feishu"):
+        return jsonify({"success": False, "message": "请先在设置中选择钉钉或飞书机器人"})
+
+    reader = monitor_instance or TwitterAIMonitor("")
+    tweet = next((item for item in reader.get_all_tweets() if item.get("id") == tweet_id and not is_comment(item)), None)
+    if not tweet:
+        return jsonify({"success": False, "message": "推文未找到"})
+
+    sender = TwitterAIMonitor(
+        "",
+        dingtalk_webhook=config.get("DINGTALK_WEBHOOK", ""),
+        dingtalk_secret=config.get("DINGTALK_SECRET", ""),
+        push_channel=push_channel,
+        feishu_webhook=config.get("FEISHU_WEBHOOK", ""),
+        feishu_secret=config.get("FEISHU_SECRET", ""),
+    )
+    sender.ensure_translation(tweet)
+    success = sender.send_push_notification(tweet)
+    return jsonify({"success": success, "message": "发送成功" if success else "发送失败，请检查机器人配置"})
 
 @app.route('/api/test_dingtalk', methods=['POST'])
 @login_required
@@ -532,7 +572,6 @@ def test_dingtalk_api():
             secret, 
             "测试账号", 
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "这是一条测试消息的标题",
             "这是一条测试消息，用于验证钉钉机器人配置是否正确。如果收到此消息，说明配置成功！🎉"
         )
         
@@ -543,6 +582,17 @@ def test_dingtalk_api():
             
     except Exception as e:
         return jsonify({"success": False, "message": f"❌ 测试失败: {str(e)}"})
+
+@app.route('/api/test_feishu', methods=['POST'])
+@login_required
+def test_feishu_api():
+    """测试飞书推送。"""
+    config = load_config()
+    if config.get("PUSH_CHANNEL") != "feishu" or not config.get("FEISHU_WEBHOOK") or not config.get("FEISHU_SECRET"):
+        return jsonify({"success": False, "message": "请先选择飞书并完整填写配置"})
+    monitor = TwitterAIMonitor("", push_channel="feishu", feishu_webhook=config["FEISHU_WEBHOOK"], feishu_secret=config["FEISHU_SECRET"])
+    success = monitor.send_feishu_notification({"author": "测试账号", "created_at": datetime.utcnow().isoformat(), "original_text": "Hello from X"})
+    return jsonify({"success": success, "message": "✅ 飞书测试消息发送成功" if success else "❌ 飞书测试消息发送失败"})
 
 def cleanup_sessions():
     """定期清理过期的session"""
@@ -564,7 +614,7 @@ if __name__ == '__main__':
     cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
     cleanup_thread.start()
     
-    print("🚀 启动Twitter AI监控系统...")
+    print("🚀 启动 Twitter(X) 监控系统...")
     print("🔐 认证系统已启用，默认用户将在首次启动时自动创建")
     print("📝 默认密码将保存到 data/default_password.txt 文件中")
     

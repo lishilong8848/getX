@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Twitter AI 监控系统启动脚本
+Twitter(X) 监控系统启动脚本
 """
 
 import os
@@ -13,7 +13,6 @@ def check_dependencies():
     try:
         import flask
         import requests
-        import openai
         import sqlite3
         print("✓ 所有依赖包已安装")
         return True
@@ -32,7 +31,7 @@ def create_directories():
 def main():
     """主函数"""
     print("=" * 50)
-    print("    Twitter AI 监控系统")
+    print("    Twitter(X) 监控系统")
     print("=" * 50)
     
     # 检查依赖

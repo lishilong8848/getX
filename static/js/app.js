@@ -27,7 +27,8 @@ document.addEventListener('DOMContentLoaded', function() {
         // 推文卡片点击事件
         const tweetCards = document.querySelectorAll('.tweet-card');
         tweetCards.forEach(card => {
-            card.addEventListener('click', function() {
+            card.addEventListener('click', function(e) {
+                if (e.target.closest('a, button, input, select, textarea')) return;
                 const tweetId = this.dataset.tweetId;
                 if (tweetId) {
                     window.location.href = `/tweet/${tweetId}`;
@@ -330,6 +331,12 @@ class API {
         const params = new URLSearchParams(filters);
         return this.request(`/api/tweets?${params}`);
     }
+
+    static async pushTweet(tweetId) {
+        return this.request(`/api/push_tweet/${tweetId}`, {
+            method: 'POST'
+        });
+    }
 }
 
 // 暴露API类
@@ -404,6 +411,9 @@ function initApp() {
     
     // 初始化推文卡片功能
     initTweetCards();
+
+    // 初始化手动推送
+    initPushTweetButtons();
     
     // 初始化监控状态更新
     initMonitoringStatus();
@@ -440,12 +450,41 @@ function initDateFilter() {
 function initTweetCards() {
     // 推文卡片点击事件
     document.addEventListener('click', function(e) {
+        if (e.target.closest('a, button, input, select, textarea')) return;
         const tweetCard = e.target.closest('.tweet-card');
         if (tweetCard) {
             const tweetId = tweetCard.getAttribute('data-tweet-id');
             if (tweetId) {
                 window.location.href = `/tweet/${tweetId}`;
             }
+        }
+    });
+}
+
+function initPushTweetButtons() {
+    if (window.pushTweetButtonsBound) return;
+    window.pushTweetButtonsBound = true;
+    document.addEventListener('click', async function(e) {
+        const button = e.target.closest('.push-tweet-btn');
+        if (!button) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const originalText = button.innerHTML;
+        button.disabled = true;
+        button.innerHTML = '<i class="bi bi-hourglass-split"></i> 发送中...';
+        try {
+            const result = await API.pushTweet(button.dataset.tweetId);
+            button.innerHTML = result.success ? '<i class="bi bi-check2"></i> 已发送' : originalText;
+            TwitterAI.showMessage(result.message, result.success ? 'success' : 'danger');
+            setTimeout(() => {
+                button.innerHTML = originalText;
+                button.disabled = false;
+            }, 2000);
+        } catch (error) {
+            button.innerHTML = originalText;
+            button.disabled = false;
+            TwitterAI.showMessage(error.message || '发送失败', 'danger');
         }
     });
 }

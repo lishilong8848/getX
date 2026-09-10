@@ -1,0 +1,23 @@
+{
+  "TWITTER_API_KEY": "",
+  "TARGET_ACCOUNTS": [
+    "OpenAI"
+  ],
+  "CHECK_INTERVAL": 300,
+  "INITIAL_HOURS": 24,
+  "EXCLUDE_REPLIES": false,
+  "DINGTALK_WEBHOOK": "",
+  "DINGTALK_SECRET": "",
+  "ENABLE_DINGTALK": false,
+  "PUSH_CHANNEL": "none",
+  "FEISHU_WEBHOOK": "",
+  "FEISHU_SECRET": "",
+  "FEISHU_APP_ID": "",
+  "FEISHU_APP_SECRET": "",
+  "FEISHU_APP_TOKEN": "",
+  "FEISHU_TABLE_ID": "",
+  "DEEPL_API_KEY": "",
+  "AI_MAX_RETRIES": 3,
+  "AI_TIMEOUT": 30,
+  "AI_MAX_TOKENS": 1000
+}

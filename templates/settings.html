@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 
-{% block title %}设置 - Twitter(X) AI 监控系统{% endblock %}
+{% block title %}设置 - Twitter(X) 监控系统{% endblock %}
 
 {% block content %}
 <div class="row">
     <div class="col-12">
             <h1 style="background: linear-gradient(45deg, #667eea, #764ba2, #f093fb); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;">
-        <i class="bi bi-motherboard"></i> Twitter(X) AI 监控系统
+        <i class="bi bi-motherboard"></i> Twitter(X) 监控系统
     </h1>
     <p style="color: rgba(184, 197, 209, 0.8);">Configure AI systems and monitoring parameters</p>
     </div>
@@ -133,50 +133,10 @@
     <div class="col-md-6">
         <div class="card">
             <div class="card-header">
-                <h5 class="mb-0"><i class="bi bi-cpu"></i> AI System Parameters</h5>
+                <h5 class="mb-0"><i class="bi bi-cpu"></i> System Parameters</h5>
             </div>
             <div class="card-body">
                 <form id="config-form">
-                    <!-- API配置 -->
-                    <div class="row mb-4">
-                        <div class="col-12">
-                            <h6 class="border-bottom pb-2">API 配置</h6>
-                        </div>
-                        <div class="col-12 mb-3">
-                            <label for="twitter-api-key" class="form-label">
-                                Twitter API Key <span class="text-danger">*</span>
-                            </label>
-                            <input type="password" class="form-control" id="twitter-api-key" name="TWITTER_API_KEY" 
-                                   value="{{ config.TWITTER_API_KEY }}" required
-                                   placeholder="请输入 TwitterAPI.io 的 API Key">
-                            <div class="form-text">
-                                从 <a href="https://twitterapi.io" target="_blank">TwitterAPI.io</a> 获取 API Key
-                            </div>
-                        </div>
-                        <div class="col-12 mb-3">
-                            <label for="llm-url" class="form-label">
-                                大模型 URL <span class="text-danger">*</span>
-                            </label>
-                            <input type="url" class="form-control" id="llm-url" name="LLM_URL" 
-                                   value="{{ config.LLM_URL }}" required
-                                   placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
-                            <div class="form-text">
-                                大模型API的基础URL
-                            </div>
-                        </div>
-                        <div class="col-12 mb-3">
-                            <label for="llm-api-key" class="form-label">
-                                大模型 API Key <span class="text-danger">*</span>
-                            </label>
-                            <input type="password" class="form-control" id="llm-api-key" name="LLM_API_KEY" 
-                                   value="{{ config.LLM_API_KEY }}" required
-                                   placeholder="请输入大模型的 API Key">
-                            <div class="form-text">
-                                通义千问或其他兼容OpenAI格式的API Key
-                            </div>
-                        </div>
-                    </div>
-
                     <!-- 监控配置 -->
                     <div class="row mb-4">
                         <div class="col-12">
@@ -210,30 +170,25 @@
                             </label>
                             <input type="number" class="form-control" id="initial-hours" name="INITIAL_HOURS" 
                                    value="{{ config.INITIAL_HOURS }}" min="1" max="168"
-                                   placeholder="2">
+                                   placeholder="24">
                             <div class="form-text">
                                 首次启动时回溯多长时间的推文
                             </div>
                         </div>
                     </div>
 
-                    <!-- 钉钉机器人配置 -->
                     <div class="row">
                         <div class="col-12 mb-3">
-                            <div class="form-check">
-                                <input class="form-check-input" type="checkbox" id="enable-dingtalk" name="ENABLE_DINGTALK" 
-                                       value="true" {% if config.ENABLE_DINGTALK %}checked{% endif %}>
-                                <label class="form-check-label" for="enable-dingtalk">
-                                    <i class="bi bi-bell"></i> 启用钉钉机器人推送
-                                </label>
-                                <div class="form-text">
-                                    启用后，新检测到的推文将自动推送到钉钉群
-                                </div>
-                            </div>
+                            <label for="push-channel" class="form-label">推送渠道</label>
+                            <select class="form-select" id="push-channel" name="PUSH_CHANNEL">
+                                <option value="none" {% if config.PUSH_CHANNEL == 'none' %}selected{% endif %}>不推送</option>
+                                <option value="dingtalk" {% if config.PUSH_CHANNEL == 'dingtalk' %}selected{% endif %}>钉钉机器人</option>
+                                <option value="feishu" {% if config.PUSH_CHANNEL == 'feishu' %}selected{% endif %}>飞书机器人</option>
+                            </select>
                         </div>
                     </div>
 
-                    <div class="row" id="dingtalk-config" {% if not config.ENABLE_DINGTALK %}style="display: none;"{% endif %}>
+                    <div class="row" id="dingtalk-config" {% if config.PUSH_CHANNEL != 'dingtalk' %}style="display: none;"{% endif %}>
                         <div class="col-md-6 mb-3">
                             <label for="dingtalk-webhook" class="form-label">
                                 钉钉Webhook地址 <span class="text-danger">*</span>
@@ -266,6 +221,22 @@
                         </div>
                     </div>
 
+                    <div class="row" id="feishu-config" {% if config.PUSH_CHANNEL != 'feishu' %}style="display: none;"{% endif %}>
+                        <div class="col-md-6 mb-3">
+                            <label for="feishu-webhook" class="form-label">飞书 Webhook 地址</label>
+                            <input type="url" class="form-control" id="feishu-webhook" name="FEISHU_WEBHOOK"
+                                   value="{{ config.FEISHU_WEBHOOK }}" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxx">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="feishu-secret" class="form-label">飞书签名密钥</label>
+                            <input type="password" class="form-control" id="feishu-secret" name="FEISHU_SECRET"
+                                   value="{{ config.FEISHU_SECRET }}" placeholder="机器人安全设置中的签名密钥">
+                        </div>
+                        <div class="col-12 mb-3">
+                            <button type="button" class="btn btn-outline-info" id="test-feishu"><i class="bi bi-bell"></i> 测试飞书推送</button>
+                        </div>
+                    </div>
+
                     <!-- 保存按钮 -->
                     <div class="row">
                         <div class="col-12">
@@ -295,18 +266,18 @@
             <div class="card-body">
                 <div class="row">
                     <div class="col-md-6">
-                        <h6>API Key 获取</h6>
+                        <h6>抓取和翻译</h6>
                         <ul>
-                            <li><strong>Twitter API:</strong> 访问 <a href="https://twitterapi.io" target="_blank">TwitterAPI.io</a> 注册并获取API Key</li>
-                            <li><strong>大模型API:</strong> 访问 <a href="https://dashscope.aliyuncs.com" target="_blank">阿里云通义千问</a> 获取API Key</li>
+                            <li><strong>X 推文:</strong> 自动从公开页面抓取，无需登录和 TwitterAPI.io Key</li>
+                            <li><strong>翻译:</strong> 英文推文使用本地 Argos Translate 翻译为中文</li>
                         </ul>
                     </div>
                     <div class="col-md-6">
                         <h6>配置建议</h6>
                         <ul>
-                            <li><strong>检查间隔:</strong> 建议300秒以上，避免API限制</li>
-                            <li><strong>监控账号:</strong> 建议同时监控3-5个账号</li>
-                            <li><strong>回溯时间:</strong> 首次运行建议1-2小时</li>
+                            <li><strong>检查间隔:</strong> 建议300秒以上，降低公开源限流概率</li>
+                            <li><strong>监控账号:</strong> 免费公开抓取适合少量账号，当前建议只监控1个账号</li>
+                            <li><strong>回溯时间:</strong> 首次运行建议24小时，避免漏掉当天稍早发布的推文</li>
                         </ul>
                     </div>
                 </div>
@@ -322,7 +293,7 @@
                                 <li><strong>设置安全:</strong> 选择"签名"安全设置，复制签名密钥</li>
                                 <li><strong>配置推送:</strong> 在系统中启用钉钉推送，填入Webhook和签名密钥</li>
                             </ol>
-                            <p class="mb-0"><strong>注意:</strong> 钉钉机器人有发送频率限制，建议检查间隔设置为300秒以上。配置完成后，新检测到的推文将自动推送到钉钉群，消息格式美观，包含作者、时间、AI翻译内容等信息。</p>
+                            <p class="mb-0"><strong>注意:</strong> 钉钉机器人有发送频率限制，建议检查间隔设置为300秒以上。配置完成后，新检测到的推文将自动推送到当前选择的群机器人，消息包含作者、时间、原文和本地翻译。</p>
                         </div>
                     </div>
                 </div>
@@ -526,14 +497,10 @@ document.querySelectorAll('input[type="password"]').forEach(function(input) {
     });
 });
 
-// 钉钉配置显示/隐藏逻辑
-document.getElementById('enable-dingtalk').addEventListener('change', function() {
-    const dingtalkConfig = document.getElementById('dingtalk-config');
-    if (this.checked) {
-        dingtalkConfig.style.display = 'block';
-    } else {
-        dingtalkConfig.style.display = 'none';
-    }
+// 推送渠道单选
+document.getElementById('push-channel').addEventListener('change', function() {
+    document.getElementById('dingtalk-config').style.display = this.value === 'dingtalk' ? 'flex' : 'none';
+    document.getElementById('feishu-config').style.display = this.value === 'feishu' ? 'flex' : 'none';
 });
 
 // 钉钉测试按钮
@@ -571,6 +538,20 @@ document.getElementById('test-dingtalk').addEventListener('click', function() {
         btn.disabled = false;
         btn.innerHTML = '<i class="bi bi-bell"></i> 测试钉钉推送';
     });
+});
+
+document.getElementById('test-feishu').addEventListener('click', function() {
+    const btn = this;
+    btn.disabled = true;
+    fetch('/api/test_feishu', {method: 'POST'})
+        .then(response => response.json())
+        .then(data => {
+            const messageDiv = document.getElementById('config-message');
+            messageDiv.style.display = 'block';
+            messageDiv.className = data.success ? 'alert alert-success mt-3' : 'alert alert-danger mt-3';
+            messageDiv.textContent = data.message;
+        })
+        .finally(() => { btn.disabled = false; });
 });
 
 // 状态组件更新函数
