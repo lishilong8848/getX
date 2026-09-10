@@ -71,6 +71,8 @@ logs/
 config.local.json
 config.local.yaml
 config.local.yml
+# 项目主配置（含飞书/钉钉凭据等敏感信息）不入版本控制，使用 config.example.json 作为模板
+config.json
 
 # ======================
 # IDE / 编辑器

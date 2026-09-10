@@ -14,7 +14,18 @@ import requests
 
 BASE = "https://open.feishu.cn/open-apis"
 DEFAULT_TIMEOUT = 15
-TOKEN_TTL_SECONDS = 60 * 110  # tenant_access_token 有效期 2 小时，提前 10 分钟刷新
+TOKEN_TTL_SECONDS = 60 * 90  # tenant_access_token 有效期 2 小时；保守 90 分钟刷新一次
+
+# 飞书 Bitable 返回的 token 相关错误码（用于触发强制刷新重试）
+_TOKEN_INVALID_CODES = {
+    99991663,  # token invalid
+    99991664,  # token expired
+    99991668,  # invalid access token
+    99991669,  # access token expired
+    230001,    # token 缺失/格式错
+    230002,    # token 无效
+    230020,    # token 已过期
+}
 
 
 class FeishuBitable:
@@ -42,9 +53,8 @@ class FeishuBitable:
         self._field_id_map: dict[str, str] | None = None
 
     # ---------------- 鉴权 ----------------
-    def _ensure_token(self) -> str:
-        if self._token and time.time() < self._token_expire_at:
-            return self._token
+    def _refresh_token(self) -> str:
+        """强制刷新 token（忽略缓存）。"""
         r = requests.post(
             f"{self.base}/auth/v3/tenant_access_token/internal",
             json={"app_id": self.app_id, "app_secret": self.app_secret},
@@ -57,21 +67,50 @@ class FeishuBitable:
         self._token_expire_at = time.time() + TOKEN_TTL_SECONDS
         return self._token
 
+    def _ensure_token(self) -> str:
+        if self._token and time.time() < self._token_expire_at:
+            return self._token
+        return self._refresh_token()
+
     def _headers(self) -> dict:
         return {
             "Authorization": f"Bearer {self._ensure_token()}",
             "Content-Type": "application/json; charset=utf-8",
         }
 
+    def _is_token_error(self, data: dict) -> bool:
+        """判断响应是否属于 token 失效/过期。"""
+        code = data.get("code")
+        if code in _TOKEN_INVALID_CODES:
+            return True
+        msg = (data.get("msg") or "").lower()
+        return ("access token" in msg and ("invalid" in msg or "expired" in msg)) or \
+               ("invalid access token" in msg)
+
+    def _request_with_token_retry(self, method: str, url: str, *, params=None, json_body=None, max_retries: int = 1):
+        """统一请求方法：遇 token 失效错误强制刷新后再重试一次。"""
+        for attempt in range(max_retries + 1):
+            resp = requests.request(method, url, params=params, json=json_body,
+                                    headers=self._headers(), timeout=self.timeout)
+            try:
+                data = resp.json()
+            except Exception:
+                resp.raise_for_status()
+                return resp
+            if self._is_token_error(data) and attempt < max_retries:
+                # 强制刷新 token 再试
+                self._refresh_token()
+                continue
+            return resp
+
     # ---------------- 字段 ----------------
     def get_field_id_map(self, refresh: bool = False) -> dict[str, str]:
         """获取 {字段名: field_id} 映射。缓存到内存。"""
         if self._field_id_map is not None and not refresh:
             return self._field_id_map
-        r = requests.get(
+        r = self._request_with_token_retry(
+            "GET",
             f"{self.base}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/fields",
-            headers=self._headers(),
-            timeout=self.timeout,
         )
         data = r.json()
         if data.get("code") != 0:
@@ -102,7 +141,7 @@ class FeishuBitable:
             params: dict[str, Any] = {"page_size": 500, "automatic_fields": "false"}
             if page_token:
                 params["page_token"] = page_token
-            r = requests.get(url, params=params, headers=self._headers(), timeout=self.timeout)
+            r = self._request_with_token_retry("GET", url, params=params)
             data = r.json()
             if data.get("code") != 0:
                 raise RuntimeError(f"列出记录失败: {data}")
@@ -190,7 +229,7 @@ class FeishuBitable:
 
         body = {"fields": body_fields, "automatic_fields": False}
         url = f"{self.base}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records"
-        r = requests.post(url, json=body, headers=self._headers(), timeout=self.timeout)
+        r = self._request_with_token_retry("POST", url, json_body=body)
         data = r.json()
         if data.get("code") != 0:
             raise RuntimeError(f"写入记录失败: {json.dumps(data, ensure_ascii=False)[:300]}")
