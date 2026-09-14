@@ -591,7 +591,7 @@ class TwitterAIMonitor:
                 params = {"page_size": 500, "automatic_fields": "false"}
                 if page_token:
                     params["page_token"] = page_token
-                r = requests.get(url, params=params, headers=self.bitable._headers(), timeout=self.bitable.timeout)
+                r = self.bitable._request_with_token_retry("GET", url, params=params)
                 data = r.json()
                 if data.get("code") != 0:
                     print(f"⚠️ 拉取多维表格记录失败: {data.get('msg')}")
