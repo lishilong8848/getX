@@ -72,6 +72,26 @@ def extract_x_image_urls(page_html: str, encoded_id: str) -> list[str]:
     return coerce_image_urls(urls)
 
 
+def extract_x_detail_text_and_time(page_html: str, encoded_id: str) -> tuple[str, str] | None:
+    pos = page_html.find(f'"client:{encoded_id}:details":')
+    if pos < 0:
+        return None
+    block = page_html[pos:pos + 2500]
+    text = re.search(r'full_text:"((?:\\.|[^"\\])*)"', block)
+    created_ms = re.search(r'created_at_ms:(\d+)', block)
+    if not text or not created_ms:
+        return None
+    return html.unescape(json.loads(f'"{text.group(1)}"')).strip(), created_ms.group(1)
+
+
+def extract_x_quoted_tweet_ids(page_html: str, encoded_id: str) -> list[str]:
+    pos = page_html.find(f'"{encoded_id}":')
+    if pos < 0:
+        return []
+    block = page_html[pos:pos + 2500]
+    return list(dict.fromkeys(re.findall(r'quoted_tweet_results:\$R\[\d+\]=\{__ref:"TweetResults:(\d+)"\}', block)))
+
+
 def parse_nitter_tweets(page_html: str, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False, source: str = "") -> list:
     tweets = []
     blocks = re.findall(r'<div class="timeline-item[^"]*"[^>]*data-username="([^"]+)"[^>]*>(.*?)(?=<div class="timeline-item|\Z)', page_html, re.S)
@@ -168,13 +188,12 @@ def parse_x_profile_tweets(page_html: str, account: str, since_time: datetime, u
             continue
 
         encoded_id = base64.b64encode(f"Tweet:{tweet_id}".encode()).decode()
-        match = re.search(rf'"client:{re.escape(encoded_id)}:details".*?full_text:"((?:\\.|[^"\\])*)".*?created_at_ms:(\d+)', page_html, re.S)
-        if not match:
+        details = extract_x_detail_text_and_time(page_html, encoded_id)
+        if not details:
             continue
-        raw_text, created_ms = match.groups()
+        text, created_ms = details
         seen.add(tweet_id)
         try:
-            text = html.unescape(json.loads(f'"{raw_text}"')).strip()
             created_at = datetime.fromtimestamp(int(created_ms) / 1000, timezone.utc).replace(tzinfo=None)
         except Exception:
             continue
@@ -187,8 +206,14 @@ def parse_x_profile_tweets(page_html: str, account: str, since_time: datetime, u
             long_tweet_ids.append(tweet_id)
         tweet = {"id": tweet_id, "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": account}
         image_urls = extract_x_image_urls(page_html, encoded_id)
+        for quoted_id in extract_x_quoted_tweet_ids(page_html, encoded_id):
+            quoted_encoded_id = base64.b64encode(f"Tweet:{quoted_id}".encode()).decode()
+            quoted_details = extract_x_detail_text_and_time(page_html, quoted_encoded_id)
+            if quoted_details and quoted_details[0] and quoted_details[0] not in text:
+                tweet["text"] += "\n\n" + quoted_details[0]
+            image_urls.extend(extract_x_image_urls(page_html, quoted_encoded_id))
         if image_urls:
-            tweet["image_urls"] = image_urls
+            tweet["image_urls"] = coerce_image_urls(image_urls)
         tweets.append(tweet)
     tweets.sort(key=lambda item: item["createdAt"], reverse=True)
     return tweets, long_tweet_ids
