@@ -545,6 +545,10 @@ def push_tweet_api(tweet_id):
         push_channel=push_channel,
         feishu_webhook=config.get("FEISHU_WEBHOOK", ""),
         feishu_secret=config.get("FEISHU_SECRET", ""),
+        feishu_app_id=config.get("FEISHU_APP_ID", ""),
+        feishu_app_secret=config.get("FEISHU_APP_SECRET", ""),
+        feishu_app_token=config.get("FEISHU_APP_TOKEN", ""),
+        feishu_table_id=config.get("FEISHU_TABLE_ID", ""),
     )
     sender.ensure_translation(tweet)
     success = sender.send_push_notification(tweet)
@@ -590,7 +594,16 @@ def test_feishu_api():
     config = load_config()
     if config.get("PUSH_CHANNEL") != "feishu" or not config.get("FEISHU_WEBHOOK") or not config.get("FEISHU_SECRET"):
         return jsonify({"success": False, "message": "请先选择飞书并完整填写配置"})
-    monitor = TwitterAIMonitor("", push_channel="feishu", feishu_webhook=config["FEISHU_WEBHOOK"], feishu_secret=config["FEISHU_SECRET"])
+    monitor = TwitterAIMonitor(
+        "",
+        push_channel="feishu",
+        feishu_webhook=config["FEISHU_WEBHOOK"],
+        feishu_secret=config["FEISHU_SECRET"],
+        feishu_app_id=config.get("FEISHU_APP_ID", ""),
+        feishu_app_secret=config.get("FEISHU_APP_SECRET", ""),
+        feishu_app_token=config.get("FEISHU_APP_TOKEN", ""),
+        feishu_table_id=config.get("FEISHU_TABLE_ID", ""),
+    )
     success = monitor.send_feishu_notification({"author": "测试账号", "created_at": datetime.utcnow().isoformat(), "original_text": "Hello from X"})
     return jsonify({"success": success, "message": "✅ 飞书测试消息发送成功" if success else "❌ 飞书测试消息发送失败"})
 

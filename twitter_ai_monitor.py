@@ -6,6 +6,7 @@ import base64
 import html
 import re
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
 
 from feishu_bitable import FeishuBitable, build_record_payload as build_bitable_payload
 
@@ -36,7 +37,42 @@ def clean_html(value: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
 
 
-def parse_nitter_tweets(page_html: str, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False) -> list:
+def coerce_image_urls(value) -> list[str]:
+    if not value:
+        return []
+    items = re.split(r"[\r\n,]+", value) if isinstance(value, str) else value
+    urls = []
+    for item in items:
+        url = html.unescape(str(item)).strip().replace("\\/", "/")
+        if url and url.startswith(("http://", "https://")) and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def extract_nitter_image_urls(block: str, source: str = "") -> list[str]:
+    urls = []
+    for raw in re.findall(r'<(?:a|img)[^>]+(?:href|src)="([^"]+)"', block):
+        raw = html.unescape(raw)
+        if "/pic/" in raw or "pbs.twimg.com/media/" in raw:
+            urls.append(urljoin(source, raw))
+    return coerce_image_urls(urls)
+
+
+def extract_x_image_urls(page_html: str, encoded_id: str) -> list[str]:
+    # ponytail: X SSR regex parser; switch to official API if scraping format churns.
+    urls = []
+    for index in range(4):
+        pos = page_html.find(f'"client:{encoded_id}:media_entities2:{index}":')
+        if pos < 0:
+            continue
+        block = page_html[pos:pos + 1600]
+        if 'type:"photo"' not in block:
+            continue
+        urls.extend(re.findall(r'media_url_https:"(https://pbs\.twimg\.com/media/[^"\\]+)"', block))
+    return coerce_image_urls(urls)
+
+
+def parse_nitter_tweets(page_html: str, account: str, since_time: datetime, until_time: datetime, exclude_replies: bool = False, source: str = "") -> list:
     tweets = []
     blocks = re.findall(r'<div class="timeline-item[^"]*"[^>]*data-username="([^"]+)"[^>]*>(.*?)(?=<div class="timeline-item|\Z)', page_html, re.S)
     for author, block in blocks:
@@ -52,7 +88,11 @@ def parse_nitter_tweets(page_html: str, account: str, since_time: datetime, unti
         if not text or not created_at or (exclude_replies and text.startswith("@")):
             continue
         if since_time <= created_at <= until_time:
-            tweets.append({"id": link.group(2), "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": author or account})
+            tweet = {"id": link.group(2), "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": author or account}
+            image_urls = extract_nitter_image_urls(block, source)
+            if image_urls:
+                tweet["image_urls"] = image_urls
+            tweets.append(tweet)
     return tweets
 
 
@@ -145,7 +185,11 @@ def parse_x_profile_tweets(page_html: str, account: str, since_time: datetime, u
         # 检测该 Tweet 记录是否带 note_tweet 引用（长推文标记）
         if re.search(rf'note_tweet:\$R\[\d+\]=\{{__ref:"client:{re.escape(encoded_id)}:note_tweet"\}}', page_html):
             long_tweet_ids.append(tweet_id)
-        tweets.append({"id": tweet_id, "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": account})
+        tweet = {"id": tweet_id, "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": account}
+        image_urls = extract_x_image_urls(page_html, encoded_id)
+        if image_urls:
+            tweet["image_urls"] = image_urls
+        tweets.append(tweet)
     tweets.sort(key=lambda item: item["createdAt"], reverse=True)
     return tweets, long_tweet_ids
 
@@ -320,7 +364,7 @@ class TwitterAIMonitor:
             try:
                 response = requests.get(f"{source}/{account}", timeout=15, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()
-                tweets = parse_nitter_tweets(response.text, account, since_time, until_time, exclude_replies)
+                tweets = parse_nitter_tweets(response.text, account, since_time, until_time, exclude_replies, source)
                 if tweets or "timeline-item" in response.text:
                     return tweets
                 errors.append(f"{source}: 页面无推文")
@@ -388,6 +432,15 @@ class TwitterAIMonitor:
         if self.push_channel == "feishu" and self.feishu_webhook and self.feishu_secret:
             return self.send_feishu_notification(tweet_data)
         return False
+
+    def _feishu_signed_payload(self, msg_type: str, content: dict) -> dict:
+        import base64
+        import hashlib
+        import hmac
+
+        timestamp = str(int(time.time()))
+        sign = base64.b64encode(hmac.new(f"{timestamp}\n{self.feishu_secret}".encode(), digestmod=hashlib.sha256).digest()).decode()
+        return {"timestamp": timestamp, "sign": sign, "msg_type": msg_type, "content": content}
     
     def send_dingtalk_notification(self, tweet_data: dict) -> bool:
         """
@@ -408,8 +461,10 @@ class TwitterAIMonitor:
             original_text = tweet_data.get('original_text', '')
             translation = tweet_data.get('translation', '')
             tweet_url = tweet_data.get('tweet_url', '')
+            image_urls = coerce_image_urls(tweet_data.get('image_urls'))
             formatted_tweet_posting_time = format_tweet_post_time(original_created_at_str)
             translation_block = f"\n## 🇨🇳 **中文翻译：**\n{translation}\n" if translation else ""
+            images_block = "\n## 🖼️ **图片：**\n" + "\n".join(f"![图片{i}]({url})" for i, url in enumerate(image_urls, 1)) + "\n" if image_urls else ""
             
             message = f"""# 📨 X 动态推送
 
@@ -421,6 +476,7 @@ class TwitterAIMonitor:
 ## 📝 **推文原文：**
 {original_text}
 {translation_block}
+{images_block}
 
 {f"🔗 [查看原推文]({tweet_url})" if tweet_url else ""}
 
@@ -475,31 +531,65 @@ class TwitterAIMonitor:
     def send_feishu_notification(self, tweet_data: dict) -> bool:
         """使用签名校验发送飞书机器人消息。"""
         try:
-            import base64
-            import hashlib
-            import hmac
-
-            timestamp = str(int(time.time()))
-            sign = base64.b64encode(hmac.new(f"{timestamp}\n{self.feishu_secret}".encode(), digestmod=hashlib.sha256).digest()).decode()
             author = tweet_data.get("author", "Unknown")
             original = tweet_data.get("original_text", "")
             translation = tweet_data.get("translation", "")
             post_time = format_tweet_post_time(tweet_data.get("created_at", ""))
             tweet_url = tweet_data.get("tweet_url", "")
+            image_urls = coerce_image_urls(tweet_data.get("image_urls"))
             translation_text = f"\n\n中文：{translation}" if translation else ""
-            response = requests.post(self.feishu_webhook, json={
-                "timestamp": timestamp,
-                "sign": sign,
-                "msg_type": "text",
-                "content": {"text": f"📨 X 动态 - @{author}\n\n发帖时间：{post_time}\n\n原文：{original}{translation_text}" + (f"\n\n链接：{tweet_url}" if tweet_url else "")},
-            }, timeout=10)
+            response = requests.post(
+                self.feishu_webhook,
+                json=self._feishu_signed_payload(
+                    "text",
+                    {"text": f"📨 X 动态 - @{author}\n\n发帖时间：{post_time}\n\n原文：{original}{translation_text}" + (f"\n\n链接：{tweet_url}" if tweet_url else "")},
+                ),
+                timeout=10,
+            )
             result = response.json()
-            success = response.ok and result.get("code", result.get("StatusCode", 0)) == 0
+            text_success = response.ok and result.get("code", result.get("StatusCode", 0)) == 0
+            images_success = True
+            for image_url in image_urls:
+                image_key = self.upload_feishu_image(image_url)
+                if not image_key:
+                    images_success = False
+                    continue
+                image_response = requests.post(
+                    self.feishu_webhook,
+                    json=self._feishu_signed_payload("image", {"image_key": image_key}),
+                    timeout=10,
+                )
+                image_result = image_response.json()
+                images_success = images_success and image_response.ok and image_result.get("code", image_result.get("StatusCode", 0)) == 0
+            success = text_success and images_success
             print(f"{'✅' if success else '❌'} 飞书消息发送{' 成功' if success else '失败'}: {author}")
             return success
         except Exception as error:
             print(f"❌ 飞书消息发送异常: {error}")
             return False
+
+    def upload_feishu_image(self, image_url: str) -> str:
+        if not self.bitable:
+            print("⚠️ 飞书图片发送需要配置 FEISHU_APP_ID / FEISHU_APP_SECRET")
+            return ""
+        try:
+            image = requests.get(image_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            image.raise_for_status()
+            response = requests.post(
+                f"{self.bitable.base}/im/v1/images",
+                headers={"Authorization": f"Bearer {self.bitable._ensure_token()}"},
+                data={"image_type": "message"},
+                files={"image": ("tweet.jpg", image.content, image.headers.get("Content-Type", "image/jpeg"))},
+                timeout=20,
+            )
+            data = response.json()
+            if data.get("code") != 0:
+                print(f"❌ 飞书图片上传失败: {data.get('msg')}")
+                return ""
+            return data.get("data", {}).get("image_key", "")
+        except Exception as error:
+            print(f"❌ 飞书图片上传异常: {error}")
+            return ""
     
     def load_tweets_by_date(self, date_str: str = None) -> list:
         """
@@ -558,6 +648,7 @@ class TwitterAIMonitor:
         title = self._bitable_field_value(normalized.get("文本"))
         author = self._bitable_field_value(normalized.get("作者"))
         link = self._bitable_field_value(normalized.get("推文链接"))
+        image_urls = coerce_image_urls(self._bitable_field_value(normalized.get("图片链接")))
         created_ms = normalized.get("发帖时间")
         collected_ms = normalized.get("采集时间")
         created_at = self._ms_to_iso(created_ms)
@@ -571,6 +662,7 @@ class TwitterAIMonitor:
             "translation": translation,
             "title": title,
             "tweet_url": link,
+            "image_urls": image_urls,
             "created_at": created_at,
             "createdAt": created_at,
             "timestamp": timestamp,
@@ -685,6 +777,7 @@ class TwitterAIMonitor:
                     tweet_id = tweet.get('id') or tweet.get('id_str')
                     tweet_url = f"https://twitter.com/{tweet['author']}/status/{tweet_id}"
                     original_text = tweet.get('text', '')
+                    image_urls = coerce_image_urls(tweet.get('image_urls'))
                     
                     print(f"作者：{tweet['author']}")
                     print(f"发布时间：{tweet.get('createdAt')}")
@@ -704,6 +797,8 @@ class TwitterAIMonitor:
                         'timestamp': datetime.utcnow().isoformat(),
                         'processed_date': datetime.now().strftime("%Y-%m-%d")
                     }
+                    if image_urls:
+                        tweet_data['image_urls'] = image_urls
                     self.save_tweet_data(tweet_data)
                     
                     # 添加延迟避免API频率限制
@@ -793,6 +888,7 @@ class TwitterAIMonitor:
                     tweet_id = tweet.get('id') or tweet.get('id_str')
                     tweet_url = f"https://twitter.com/{tweet['author']}/status/{tweet_id}"
                     original_text = tweet.get('text', '')
+                    image_urls = coerce_image_urls(tweet.get('image_urls'))
                     
                     update_status(f"📨 转发中... ({idx}/{len(all_tweets)})", f"@{tweet['author']}")
                     
@@ -806,6 +902,8 @@ class TwitterAIMonitor:
                         'timestamp': datetime.utcnow().isoformat(),
                         'processed_date': datetime.now().strftime("%Y-%m-%d")
                     }
+                    if image_urls:
+                        tweet_data['image_urls'] = image_urls
                     self.save_tweet_data(tweet_data)
                     
                     # 更新处理计数

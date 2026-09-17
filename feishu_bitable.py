@@ -118,6 +118,20 @@ class FeishuBitable:
         self._field_id_map = {item["field_name"]: item["field_id"] for item in data["data"]["items"]}
         return self._field_id_map
 
+    def ensure_text_field(self, field_name: str) -> dict[str, str]:
+        field_map = self.get_field_id_map()
+        if field_name in field_map:
+            return field_map
+        r = self._request_with_token_retry(
+            "POST",
+            f"{self.base}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/fields",
+            json_body={"field_name": field_name, "type": 1},
+        )
+        data = r.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"创建字段失败: {json.dumps(data, ensure_ascii=False)[:300]}")
+        return self.get_field_id_map(refresh=True)
+
     # ---------------- 查重 ----------------
     def record_exists(self, tweet_id: str) -> bool:
         """按推文ID判断记录是否已存在。
@@ -210,6 +224,11 @@ class FeishuBitable:
         """
         # Bitable add_record 接受字段名（不是 field_id）
         field_map = self.get_field_id_map()
+        if fields.get("图片链接") and "图片链接" not in field_map:
+            try:
+                field_map = self.ensure_text_field("图片链接")
+            except Exception as error:
+                print(f"⚠️ 创建图片链接字段失败，将跳过图片保存: {error}")
         body_fields: dict = {}
         for name, raw in fields.items():
             if name not in field_map:
@@ -249,6 +268,9 @@ def build_record_payload(tweet_data: dict, account: str | None = None, now: date
     original_text = tweet_data.get("original_text") or tweet_data.get("text", "")
     translation = tweet_data.get("translation", "")
     tweet_url = tweet_data.get("tweet_url", "")
+    image_urls = tweet_data.get("image_urls") or []
+    if isinstance(image_urls, str):
+        image_urls = [line.strip() for line in image_urls.splitlines() if line.strip()]
 
     # 文本字段：用第一行做"标题"，全文做"原文"，翻译做"译文"
     first_line = original_text.splitlines()[0].strip() if original_text else ""
@@ -264,4 +286,6 @@ def build_record_payload(tweet_data: dict, account: str | None = None, now: date
         "发帖时间": created_at,
         "采集时间": now,
     }
+    if image_urls:
+        payload["图片链接"] = "\n".join(map(str, image_urls))
     return payload

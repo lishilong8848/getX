@@ -93,6 +93,13 @@
                             </p>
                         </div>
                         {% endif %}
+                        {% if tweet.image_urls %}
+                        <div class="mt-3 d-flex flex-wrap gap-2">
+                            {% for image_url in tweet.image_urls[:4] %}
+                            <img src="{{ image_url }}" loading="lazy" alt="推文图片" class="rounded" style="width: 92px; height: 92px; object-fit: cover;">
+                            {% endfor %}
+                        </div>
+                        {% endif %}
                     </div>
                     <div class="card-footer text-muted">
                         <small>
