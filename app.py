@@ -10,7 +10,7 @@ import hashlib
 import base64
 import urllib.parse
 import requests
-from twitter_ai_monitor import TwitterAIMonitor
+from twitter_ai_monitor import TwitterAIMonitor, is_reply_text
 from auth import auth_manager, login_required, get_current_user_id
 
 app = Flask(__name__)
@@ -77,7 +77,7 @@ def parse_twitter_time(twitter_time_str):
 
 def is_comment(tweet):
     """原文以 @ 开头的推文视为评论。"""
-    return tweet.get('original_text', '').startswith('@')
+    return is_reply_text(tweet.get('original_text', ''))
 
 def tweet_created_sort_key(tweet):
     return parse_twitter_time(tweet.get('created_at', ''))
@@ -161,7 +161,7 @@ def load_config():
         "TWITTER_API_KEY": "",
         "TARGET_ACCOUNTS": ["OpenAI"],
         "CHECK_INTERVAL": 300,
-        "INITIAL_HOURS": 24,
+        "INITIAL_HOURS": 1,
         "DINGTALK_WEBHOOK": "",
         "DINGTALK_SECRET": "",
         "ENABLE_DINGTALK": False,

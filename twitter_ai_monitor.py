@@ -22,6 +22,10 @@ BAD_TRANSLATION_MARKERS = ("AI处理失败", "翻译异常", "处理异常", "In
 _ARGOS_READY = False
 
 
+def is_reply_text(text: str) -> bool:
+    return (text or "").lstrip().startswith("@")
+
+
 def parse_nitter_time(value: str) -> datetime | None:
     match = re.search(r"([A-Z][a-z]{2}) (\d{1,2}), (\d{4}) · (\d{1,2}):(\d{2}) (AM|PM) UTC", value)
     if not match:
@@ -105,7 +109,7 @@ def parse_nitter_tweets(page_html: str, account: str, since_time: datetime, unti
             continue
         text = clean_html(content.group(1))
         created_at = parse_nitter_time(html.unescape(date.group(1)))
-        if not text or not created_at or (exclude_replies and text.startswith("@")):
+        if not text or not created_at or (exclude_replies and is_reply_text(text)):
             continue
         if since_time <= created_at <= until_time:
             tweet = {"id": link.group(2), "text": text, "createdAt": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"), "author": author or account}
@@ -197,7 +201,7 @@ def parse_x_profile_tweets(page_html: str, account: str, since_time: datetime, u
             created_at = datetime.fromtimestamp(int(created_ms) / 1000, timezone.utc).replace(tzinfo=None)
         except Exception:
             continue
-        if not text or (exclude_replies and text.startswith("@")):
+        if not text or (exclude_replies and is_reply_text(text)):
             continue
         if not (since_time <= created_at <= until_time):
             continue
@@ -348,7 +352,7 @@ class TwitterAIMonitor:
 
             changed = False
             for tweet in tweets:
-                if tweet.get('original_text', '').startswith('@'):
+                if is_reply_text(tweet.get('original_text', '')):
                     continue
                 old_translation = tweet.get('translation')
                 self.ensure_translation(tweet)
@@ -767,12 +771,9 @@ class TwitterAIMonitor:
         :param hours: 初始回溯时间（小时）
         :param exclude_replies: 是否排除回复推文
         """
-        last_checked_time = datetime.utcnow() - timedelta(hours=hours)
-        
         def check_and_process_tweets():
-            nonlocal last_checked_time
             until_time = datetime.utcnow()
-            since_time = last_checked_time
+            since_time = until_time - timedelta(hours=hours)
             
             all_tweets = []
             all_accounts_ok = True
@@ -783,7 +784,7 @@ class TwitterAIMonitor:
                     all_tweets.extend(tweets)
                 except Exception as e:
                     all_accounts_ok = False
-                    print(f"❌ 获取 @{account} 推文失败，保留检查窗口下轮重试: {str(e)}")
+                    print(f"❌ 获取 @{account} 推文失败，下轮继续回扫最近 {hours} 小时: {str(e)}")
                 
                 # 添加5秒延迟，避免API限制
                 if account != target_accounts[-1]:  # 如果不是最后一个账号，添加延迟
@@ -829,12 +830,9 @@ class TwitterAIMonitor:
                     # 添加延迟避免API频率限制
                     time.sleep(2)
             elif not all_accounts_ok:
-                print(f"{datetime.utcnow()} - 抓取失败，保留上次检查时间，下轮继续补抓。")
+                print(f"{datetime.utcnow()} - 抓取失败，下轮继续回扫最近 {hours} 小时。")
             else:
                 print(f"{datetime.utcnow()} - 没有发现新推文。")
-            
-            if all_accounts_ok:
-                last_checked_time = until_time
         
         print(f"开始监控账号: {', '.join(target_accounts)}")
         print(f"检查间隔: {check_interval} 秒")
@@ -858,8 +856,6 @@ class TwitterAIMonitor:
         :param status_dict: 状态字典，用于更新前端显示
         :param exclude_replies: 是否排除回复推文
         """
-        last_checked_time = datetime.utcnow() - timedelta(hours=hours)
-        
         def update_status(status, account="", result=""):
             if status_dict:
                 status_dict["current_status"] = status
@@ -872,9 +868,8 @@ class TwitterAIMonitor:
                 status_dict["next_check_time"] = next_time.isoformat()
         
         def check_and_process_tweets():
-            nonlocal last_checked_time
             until_time = datetime.utcnow()
-            since_time = last_checked_time
+            since_time = until_time - timedelta(hours=hours)
             
             all_tweets = []
             all_accounts_ok = True
@@ -940,12 +935,9 @@ class TwitterAIMonitor:
                 
                 update_status("✅ 处理完成", result=f"成功处理 {len(all_tweets)} 条推文")
             elif not all_accounts_ok:
-                update_status("⚠️ 抓取失败，下轮继续补抓", result="本轮抓取失败，未推进检查时间")
+                update_status("⚠️ 抓取失败，下轮继续补抓", result=f"本轮抓取失败，下轮继续回扫最近 {hours} 小时")
             else:
                 update_status("⭐ 智能待机中", result="未发现新推文，继续监控中...")
-            
-            if all_accounts_ok:
-                last_checked_time = until_time
         
         update_status("🚀 Neural Network 已启动", f"监控 {len(target_accounts)} 个账号")
         print(f"🚀 监控启动成功，目标账号: {target_accounts}")
