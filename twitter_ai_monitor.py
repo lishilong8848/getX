@@ -856,16 +856,16 @@ class TwitterAIMonitor:
         :param status_dict: 状态字典，用于更新前端显示
         :param exclude_replies: 是否排除回复推文
         """
-        def update_status(status, account="", result=""):
+        def update_status(status, account="", result="", touch_check_time=False):
             if status_dict:
                 status_dict["current_status"] = status
                 status_dict["current_account"] = account
-                status_dict["last_update"] = datetime.now().isoformat()
                 if result:
                     status_dict["last_result"] = result
-                # 计算下次检查时间
-                next_time = datetime.now() + timedelta(seconds=check_interval)
-                status_dict["next_check_time"] = next_time.isoformat()
+                if touch_check_time:
+                    now = datetime.now()
+                    status_dict["last_update"] = now.isoformat()
+                    status_dict["next_check_time"] = (now + timedelta(seconds=check_interval)).isoformat()
         
         def check_and_process_tweets():
             until_time = datetime.utcnow()
@@ -897,7 +897,7 @@ class TwitterAIMonitor:
                         continue
             except Exception as e:
                 print(f"❌ 推文扫描过程出错: {str(e)}")
-                update_status(f"⚠️ 扫描过程异常", result=f"错误: {str(e)}")
+                update_status(f"⚠️ 扫描过程异常", result=f"错误: {str(e)}", touch_check_time=True)
                 return
             
             if all_tweets:
@@ -933,11 +933,11 @@ class TwitterAIMonitor:
                     # 添加延迟避免API频率限制
                     time.sleep(2)
                 
-                update_status("✅ 处理完成", result=f"成功处理 {len(all_tweets)} 条推文")
+                update_status("✅ 处理完成", result=f"成功处理 {len(all_tweets)} 条推文", touch_check_time=True)
             elif not all_accounts_ok:
-                update_status("⚠️ 抓取失败，下轮继续补抓", result=f"本轮抓取失败，下轮继续回扫最近 {hours} 小时")
+                update_status("⚠️ 抓取失败，下轮继续补抓", result=f"本轮抓取失败，下轮继续回扫最近 {hours} 小时", touch_check_time=True)
             else:
-                update_status("⭐ 智能待机中", result="未发现新推文，继续监控中...")
+                update_status("⭐ 智能待机中", result="未发现新推文，继续监控中...", touch_check_time=True)
         
         update_status("🚀 Neural Network 已启动", f"监控 {len(target_accounts)} 个账号")
         print(f"🚀 监控启动成功，目标账号: {target_accounts}")
